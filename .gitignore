@@ -1,0 +1,26 @@
+# 编译生成的文件夹
+build/
+
+# ESP-IDF 配置文件
+sdkconfig
+sdkconfig.defaults
+
+# 编辑器配置文件夹
+.vscode/
+.idea/
+
+# 编译产生的中间文件
+*.bin
+*.elf
+*.map
+*.o
+*.a
+*.elf.dump
+
+# 日志文件或临时文件
+*.log
+*.tmp
+# 忽略整个 esp32sr 文件夹
+components/
+
+managed_components/
