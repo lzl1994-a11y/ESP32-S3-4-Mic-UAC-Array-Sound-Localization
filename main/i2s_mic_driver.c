@@ -30,7 +30,7 @@
 #define I2S_STARTUP_SETTLE_MS 20
 #define I2S_STARTUP_FLUSH_FRAMES 3
 #define I2S_CAPTURE_LOG_FRAMES 4
-#define I2S_USE_SECOND_PORT (I2S_MIC_CHANNELS > 2)
+#define I2S_USE_SECOND_PORT (MIC_COUNT > 2)
 #define INMP441_32_TO_16_SHIFT 14
 
 static const char *TAG = "i2s_mic";
@@ -276,7 +276,7 @@ static void i2s_capture_task(void *arg)
 
         for (size_t i = 0; i < s_samples_per_channel; ++i) {
             const size_t stereo_idx = i * 2;
-            const size_t out_idx = i * I2S_MIC_CHANNELS;
+            const size_t out_idx = i * MIC_COUNT;
 
             // I2S0 carries Mic0 (L) and Mic1 (R).
             frame[out_idx + 0] = inmp441_32_to_16(s_i2s0_raw[stereo_idx + 0]);
@@ -293,8 +293,8 @@ static void i2s_capture_task(void *arg)
             int16_t min_v[4] = {INT16_MAX, INT16_MAX, INT16_MAX, INT16_MAX};
             int16_t max_v[4] = {INT16_MIN, INT16_MIN, INT16_MIN, INT16_MIN};
             for (size_t j = 0; j < s_samples_per_channel; ++j) {
-                for (size_t ch = 0; ch < I2S_MIC_CHANNELS; ++ch) {
-                    int16_t v = frame[j * I2S_MIC_CHANNELS + ch];
+                for (size_t ch = 0; ch < MIC_COUNT; ++ch) {
+                    int16_t v = frame[j * MIC_COUNT + ch];
                     if (v < min_v[ch]) {
                         min_v[ch] = v;
                     }
@@ -360,7 +360,7 @@ esp_err_t i2s_mic_driver_init(size_t samples_per_channel)
 
     s_samples_per_channel = samples_per_channel;
     s_i2s_read_bytes = samples_per_channel * 2 * sizeof(int32_t);
-    s_frame_bytes = samples_per_channel * I2S_MIC_CHANNELS * sizeof(int16_t);
+    s_frame_bytes = samples_per_channel * MIC_COUNT * sizeof(int16_t);
 
     s_i2s0_raw = (int32_t *)audio_malloc(s_i2s_read_bytes);
 #if I2S_USE_SECOND_PORT

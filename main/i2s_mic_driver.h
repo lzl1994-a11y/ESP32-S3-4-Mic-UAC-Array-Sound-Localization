@@ -11,9 +11,11 @@ extern "C" {
 #endif
 
 #define I2S_MIC_SAMPLE_RATE_HZ 16000
-#define I2S_MIC_CHANNELS 4
 #define I2S_MIC_BITS_PER_SAMPLE 16
-#define I2S_FRAME_SAMPLES 512
+
+#define SAMPLES_PER_CHANNEL 512
+#define MIC_COUNT 4
+#define I2S_FRAME_SAMPLES (SAMPLES_PER_CHANNEL * MIC_COUNT)
 
 esp_err_t i2s_mic_driver_init(size_t samples_per_channel);
 esp_err_t i2s_mic_driver_start(void);

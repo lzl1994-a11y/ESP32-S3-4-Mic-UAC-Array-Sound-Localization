@@ -14,7 +14,7 @@
 #include "mic_array_config.h"
 #include "usb_composite.h"
 
-#define AUDIO_FRAME_SAMPLES I2S_FRAME_SAMPLES
+#define AUDIO_FRAME_SAMPLES SAMPLES_PER_CHANNEL
 #define AUDIO_TASK_STACK 8192
 #define AUDIO_TASK_PRIORITY 9
 #define AUDIO_TASK_CORE 1
@@ -27,7 +27,7 @@
 #define AFE_UAC_WRITE_MARGIN_MS 80
 #define AFE_UAC_WRITE_MAX_MS 500
 #define AFE_CDC_WRITE_TIMEOUT_MS 20
-#define AFE_CDC_REPORT_INTERVAL_MS 200
+#define AFE_CDC_REPORT_INTERVAL_MS 1000
 #define AFE_CDC_TASK_STACK 4096
 #define AFE_CDC_TASK_PRIORITY 5
 #define AFE_CDC_TASK_CORE 1
@@ -44,7 +44,7 @@
 #define M_PI 3.14159265358979323846
 #endif
 
-#if AFE_UAC_RAW_MIC_INDEX >= I2S_MIC_CHANNELS
+#if AFE_UAC_RAW_MIC_INDEX >= MIC_COUNT
 #error "AFE_UAC_RAW_MIC_INDEX out of range"
 #endif
 
@@ -56,7 +56,7 @@ typedef struct {
     float z;
 } mic_position_t;
 
-static const mic_position_t s_mic_positions[I2S_MIC_CHANNELS] = {
+static const mic_position_t s_mic_positions[MIC_COUNT] = {
     {MIC_ARRAY_POS0_MM_X * 0.001f, MIC_ARRAY_POS0_MM_Y * 0.001f, MIC_ARRAY_POS0_MM_Z * 0.001f},
     {MIC_ARRAY_POS1_MM_X * 0.001f, MIC_ARRAY_POS1_MM_Y * 0.001f, MIC_ARRAY_POS1_MM_Z * 0.001f},
     {MIC_ARRAY_POS2_MM_X * 0.001f, MIC_ARRAY_POS2_MM_Y * 0.001f, MIC_ARRAY_POS2_MM_Z * 0.001f},
@@ -79,6 +79,9 @@ static afe_source_position_t s_latest_position = {
     .azimuth_deg = -1,
 };
 static uint32_t s_position_sequence;
+static float s_latest_azimuth;
+static float s_latest_elevation;
+static bool s_position_valid;
 static bool s_initialized;
 static bool s_started;
 
@@ -201,13 +204,17 @@ static void publish_invalid_position(void)
         .confidence = 0,
     };
     publish_source_position(position);
+
+    portENTER_CRITICAL(&s_position_lock);
+    s_position_valid = false;
+    portEXIT_CRITICAL(&s_position_lock);
 }
 
 static int max_tdoa_lag_samples(void)
 {
     float max_distance = 0.0f;
-    for (int a = 0; a < I2S_MIC_CHANNELS; ++a) {
-        for (int b = a + 1; b < I2S_MIC_CHANNELS; ++b) {
+    for (int a = 0; a < MIC_COUNT; ++a) {
+        for (int b = a + 1; b < MIC_COUNT; ++b) {
             float distance = vec_norm(vec_sub(s_mic_positions[b], s_mic_positions[a]));
             if (distance > max_distance) {
                 max_distance = distance;
@@ -229,7 +236,7 @@ static float channel_mean(const int16_t *interleaved_frame, int mic)
 {
     int64_t sum = 0;
     for (size_t i = 0; i < s_feed_samples_per_channel; ++i) {
-        sum += interleaved_frame[i * I2S_MIC_CHANNELS + mic];
+        sum += interleaved_frame[i * MIC_COUNT + mic];
     }
     return (float)sum / (float)s_feed_samples_per_channel;
 }
@@ -237,7 +244,7 @@ static float channel_mean(const int16_t *interleaved_frame, int mic)
 static float frame_rms(const int16_t *interleaved_frame)
 {
     uint64_t sum_sq = 0;
-    const size_t total_samples = s_feed_samples_per_channel * I2S_MIC_CHANNELS;
+    const size_t total_samples = s_feed_samples_per_channel * MIC_COUNT;
     for (size_t i = 0; i < total_samples; ++i) {
         int32_t sample = interleaved_frame[i];
         sum_sq += (uint64_t)(sample * sample);
@@ -271,8 +278,8 @@ static float normalized_correlation_at_lag(const int16_t *interleaved_frame,
             idx_a = i + (size_t)(-lag);
         }
 
-        const float a = (float)interleaved_frame[idx_a * I2S_MIC_CHANNELS + mic_a] - mean_a;
-        const float b = (float)interleaved_frame[idx_b * I2S_MIC_CHANNELS + mic_b] - mean_b;
+        const float a = (float)interleaved_frame[idx_a * MIC_COUNT + mic_a] - mean_a;
+        const float b = (float)interleaved_frame[idx_b * MIC_COUNT + mic_b] - mean_b;
         sum_ab += a * b;
         sum_aa += a * a;
         sum_bb += b * b;
@@ -287,7 +294,7 @@ static float normalized_correlation_at_lag(const int16_t *interleaved_frame,
 static bool estimate_pair_delay_samples(const int16_t *interleaved_frame,
                                         int mic_a,
                                         int mic_b,
-                                        const float means[I2S_MIC_CHANNELS],
+                                        const float means[MIC_COUNT],
                                         float *delay_samples,
                                         float *peak_corr)
 {
@@ -458,8 +465,8 @@ static bool solve_far_field_vector(const float delays[AFE_NUM_MIC_PAIRS],
     }
 
     float max_distance = 0.0f;
-    for (int a = 0; a < I2S_MIC_CHANNELS; ++a) {
-        for (int b = a + 1; b < I2S_MIC_CHANNELS; ++b) {
+    for (int a = 0; a < MIC_COUNT; ++a) {
+        for (int b = a + 1; b < MIC_COUNT; ++b) {
             float d = vec_norm(vec_sub(s_mic_positions[b], s_mic_positions[a]));
             if (d > max_distance) {
                 max_distance = d;
@@ -484,7 +491,7 @@ static void update_source_position(const int16_t *interleaved_frame)
         return;
     }
 
-#if I2S_MIC_CHANNELS < 4
+#if MIC_COUNT < 4
     publish_invalid_position();
     return;
 #endif
@@ -494,8 +501,8 @@ static void update_source_position(const int16_t *interleaved_frame)
         return;
     }
 
-    float means[I2S_MIC_CHANNELS] = {0};
-    for (int mic = 0; mic < I2S_MIC_CHANNELS; ++mic) {
+    float means[MIC_COUNT] = {0};
+    for (int mic = 0; mic < MIC_COUNT; ++mic) {
         means[mic] = channel_mean(interleaved_frame, mic);
     }
 
@@ -548,6 +555,13 @@ static void update_source_position(const int16_t *interleaved_frame)
         .confidence = confidence,
     };
     publish_source_position(position);
+
+    /* Update float globals for CDC JSON reporting. */
+    portENTER_CRITICAL(&s_position_lock);
+    s_latest_azimuth = azimuth;
+    s_latest_elevation = elevation;
+    s_position_valid = true;
+    portEXIT_CRITICAL(&s_position_lock);
 }
 
 static TickType_t uac_write_timeout_ticks(size_t byte_len)
@@ -601,7 +615,7 @@ static void audio_capture_task(void *arg)
 {
     (void)arg;
 
-    const size_t capture_samples = s_feed_samples_per_channel * I2S_MIC_CHANNELS;
+    const size_t capture_samples = s_feed_samples_per_channel * MIC_COUNT;
     int16_t *capture_buffer = (int16_t *)audio_calloc(capture_samples, sizeof(int16_t));
     if (capture_buffer == NULL) {
         ESP_LOGE(TAG, "capture buffer alloc failed");
@@ -634,7 +648,7 @@ static void audio_capture_task(void *arg)
 
 #if AFE_UAC_AUDIO_SOURCE == AFE_UAC_SOURCE_RAW_MIC
         for (size_t i = 0; i < s_feed_samples_per_channel; ++i) {
-            uac_buffer[i] = capture_buffer[i * I2S_MIC_CHANNELS + AFE_UAC_RAW_MIC_INDEX];
+            uac_buffer[i] = capture_buffer[i * MIC_COUNT + AFE_UAC_RAW_MIC_INDEX];
         }
         write_uac_audio(uac_buffer,
                         s_feed_samples_per_channel * sizeof(int16_t),
@@ -656,19 +670,23 @@ static void cdc_report_task(void *arg)
     esp_err_t last_cdc_ret = ESP_OK;
 
     while (true) {
-        char line[96];
-        afe_source_position_t position;
+        char line[64];
         int len = 0;
 
-        if (afe_processor_get_source_position(&position)) {
+        portENTER_CRITICAL(&s_position_lock);
+        bool valid = s_position_valid;
+        float azi = s_latest_azimuth;
+        float ele = s_latest_elevation;
+        portEXIT_CRITICAL(&s_position_lock);
+
+        if (valid) {
             len = snprintf(line,
                            sizeof(line),
-                           "status:alive,az:%d,el:%d,conf:%d\n",
-                           position.azimuth_deg,
-                           position.elevation_deg,
-                           position.confidence);
+                           "{\"azi\":%.1f,\"ele\":%.1f}\n",
+                           (double)azi,
+                           (double)ele);
         } else {
-            len = snprintf(line, sizeof(line), "status:alive,az:invalid,el:invalid,conf:0\n");
+            len = snprintf(line, sizeof(line), "{\"azi\":null,\"ele\":null}\n");
         }
 
         esp_err_t cdc_ret = ESP_ERR_INVALID_SIZE;
@@ -709,7 +727,7 @@ esp_err_t afe_processor_init(void)
     ESP_LOGI(TAG,
              "Raw UAC/TDOA pipeline ready: frame=%u samples/ch, capture_channels=%d",
              (unsigned)s_feed_samples_per_channel,
-             I2S_MIC_CHANNELS);
+             MIC_COUNT);
     ESP_LOGI(TAG,
              "Mic positions mm: m0=(%d,%d,%d) m1=(%d,%d,%d) m2=(%d,%d,%d) m3=(%d,%d,%d)",
              float_to_int_round(MIC_ARRAY_POS0_MM_X),

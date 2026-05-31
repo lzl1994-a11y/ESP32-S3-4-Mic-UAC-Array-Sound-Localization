@@ -1,344 +1,183 @@
-# Walle Ear S3 听觉子系统开发说明
+# Walle Ear S3
 
-## 1. 项目目标
+> 基于 ESP32-S3 的 4 麦克风阵列机器人听觉前端
 
-本项目基于 ESP32-S3、ESP-IDF 5.x、INMP441 数字麦克风和 TinyUSB，实现一个“机器人听觉前端”。
+USB 即插即用：UAC 音频流 + CDC 串口实时上报声源方位角与仰角。
 
-当前推荐方案不是追求真实三维坐标，而是稳定输出声源方向：
+---
 
-- UAC：通过 ESP32-S3 原生 USB 向电脑传输 1 路单声道音频。
-- CDC：通过同一个原生 USB 口向电脑传输声源方位数据。
-- I2S：采集多路 raw mic PCM；UAC 只取其中 1 路或 AFE 输出，其他通道用于方向解算。
-- 方向解算：使用 raw mic 的 TDOA/互相关计算声源方向，输出方位角、俯仰角和置信度。
+## 特性
 
-输出重点：
+- **4 路同步采集** — 4 × INMP441 MEMS 麦克风，16kHz / 16bit
+- **声源定位** — TDOA 互相关 + 3D 远场最小二乘，6 对麦克风联合求解
+- **USB 复合设备** — 单根 USB 线同时提供 UAC 音频和 CDC 串口
+- **非共面阵列** — 第 4 个麦克风不共面，消除镜面歧义，3D 方向解唯一
+- **1 Hz 定位上报** — JSON 格式，每秒输出一次方位角与仰角
 
-```text
-azimuth_deg      方位角
-elevation_deg    俯仰角
-confidence       置信度 0-100
+---
+
+## 硬件规格
+
+| 项目 | 参数 |
+|------|------|
+| MCU | ESP32-S3 (160 MHz) |
+| 麦克风 | 4 × INMP441 |
+| 采样率 | 16000 Hz |
+| 位深 | 16-bit signed PCM |
+| USB | 2.0 Full Speed (GPIO19/GPIO20) |
+| I2S | I2S0 × 2ch + I2S1 × 2ch，共享 BCLK/WS 时钟搭桥 |
+
+---
+
+## 麦克风阵列布局
+
+```
+         +Y (前方 0°)
+          |
+     Mic2 (0, 50, 100)
+          |
+Mic0 -----+----- Mic1
+(-30,0,0) |     (30,0,0)
+          |
+     Mic3 (0, -50, 100)
 ```
 
-不建议把结果描述为真实 `x/y/z` 坐标，因为小型麦克风阵列更适合估计方向，不适合稳定估计距离。
+| Mic | X (mm) | Y (mm) | Z (mm) | 说明 |
+|-----|--------|--------|--------|------|
+| 0   | -30    | 0      | 0      | 左声道 (I2S0 L) |
+| 1   | 30     | 0      | 0      | 右声道 (I2S0 R) |
+| 2   | 0      | 50     | 100    | 前上方 (I2S1 L) |
+| 3   | 0      | -50    | 100    | 后上方 (I2S1 R)，**与其他三个不共面，消除镜面歧义** |
 
-## 2. 关键设计结论
+坐标可在 `main/mic_array_config.h` 中自定义。
 
-### 2.1 UAC 只需要 1 路音频
+---
 
-电脑端最终只需要拿到一条可用麦克风音频流，所以 UAC 保持单声道即可。
+## 角度定义
 
-推荐数据流：
+| 角度 | 符号 | 范围 | 零位 | 正向 |
+|------|------|------|------|------|
+| 方位角 Azimuth | azi | -180° ~ +180° | +Y 方向 = 0° | 绕 +Z 轴逆时针 (右手定则) |
+| 仰角 Elevation | ele | -90° ~ +90° | XY 平面 = 0° | +Z 方向为正 |
 
-```text
-Mic raw PCM -> 选择 Mic0 或 AFE 输出 -> UAC mono -> 电脑
-Mic0/Mic1/Mic2 raw PCM -> TDOA -> azimuth/elevation/confidence -> CDC
+```
+方位角：atan2(vx, vy) × 180/π
+仰  角：atan2(vz, √(vx²+vy²)) × 180/π
 ```
 
-这样可以避免把 3 路麦克风都塞进 USB 音频，也避免把定位逻辑和音频上传逻辑强耦合。
+---
 
-### 2.2 esp-sr AFE 不作为 3 麦定位核心
+## 硬件接线
 
-实测日志表明当前 esp-sr AFE 对 SR 路径最多可靠支持 2 个麦克风通道：
+```
+GPIO4  → BCLK → 4×INMP441 SCK
+GPIO5  → WS   → 4×INMP441 WS/LRCLK
+GPIO6  → DIN  → Mic0 SD + Mic1 SD        (I2S0)
+GPIO7  → DIN  → Mic2 SD + Mic3 SD        (I2S1)
 
-```text
-AFE supports two microphone channels at the most. The first two channels will be selected.
+Mic0 L/R → GND    (左声道)
+Mic1 L/R → 3V3    (右声道)
+Mic2 L/R → GND    (左声道)
+Mic3 L/R → 3V3    (右声道)
 ```
 
-因此：
+> **时钟搭桥**：I2S0 配置为 Master 输出 BCLK/WS，I2S1 配置为 Slave 输入同一组 BCLK/WS。利用 ESP32-S3 的 GPIO Matrix 实现双向路由，不需要外部硬件时钟分配器。
 
-- AFE 可以用于 1 路或 2 路降噪/增强。
-- 3 麦方向解算应使用 raw PCM 自己做 TDOA。
-- 不再要求 `esp-sr` 内部提供 3 麦 DOA。
+---
 
-### 2.3 TinyUSB CDC 不是 ESP_LOG 调试串口
+## 构建
 
-ESP32-S3 开发板上常见两个 Type-C 口：
+**前置要求**：ESP-IDF 5.x
 
-- 原生 USB 口：接 ESP32-S3 USB OTG，使用 `GPIO19/GPIO20`，可枚举 UAC 麦克风和 TinyUSB CDC。
-- USB-UART 口：接 USB 转串口芯片，通常对应 `GPIO43/GPIO44`，用于烧录、monitor 和 `ESP_LOG` 输出。
-
-所以文档中的 `usb_composite.c/.h` 指的是原生 USB 口上的业务复合设备：
-
-```text
-UAC: 传输音频
-CDC: 传输 azimuth/elevation/confidence 等业务数据
+```bash
+idf.py set-target esp32s3
+idf.py build
+idf.py flash monitor
 ```
 
-它不是默认 `ESP_LOGI()` 打印口。开发阶段建议两个 Type-C 都接电脑：原生 USB 口测 UAC/CDC，USB-UART 口看日志。
+---
 
-## 3. 角度定义
+## 使用
 
-方向解算内部使用单位方向向量：
+USB 连接后，电脑识别为两个设备：
 
-```text
-u = (ux, uy, uz)
+| 设备 | 功能 |
+|------|------|
+| **UAC 麦克风** | 16kHz / 16bit / Mono，标准 USB Audio Class 1.0 |
+| **CDC 串口** | 业务数据端口，每秒输出一行 JSON |
+
+**串口数据格式**：
+
+```json
+{"azi":-42.3,"ele":18.7}
 ```
 
-### 3.1 方位角 azimuth
+无有效声源时输出：
 
-定义：
-
-- `+Y` 方向为 `0°`。
-- 绕原点朝 `+X` 方向旋转时角度增加。
-- 朝 `-X` 方向为负角度。
-- 范围：`-180° ~ +180°`。
-
-计算公式：
-
-```c
-azimuth_deg = atan2f(ux, uy) * 180.0f / M_PI;
+```json
+{"azi":null,"ele":null}
 ```
 
-示例：
+Linux 下可用 `cat /dev/ttyACM0` 查看，Windows 用串口助手打开对应 COM 口。
 
-```text
-+Y:   0°
-+X: +90°
--X: -90°
--Y: ±180°
+---
+
+## 项目结构
+
 ```
-
-### 3.2 俯仰角 elevation
-
-定义：
-
-- `xy` 平面为 `0°`。
-- `+Z` 方向为正，最大 `+90°`。
-- `-Z` 方向为负，最小 `-90°`。
-
-计算公式：
-
-```c
-elevation_deg = atan2f(uz, sqrtf(ux * ux + uy * uy)) * 180.0f / M_PI;
-```
-
-## 4. 麦克风阵列配置
-
-### 4.1 当前 3 麦方案
-
-计划使用 3 个 INMP441，位置单位建议使用 mm，内部换算为 m：
-
-```text
-Mic0 = (  0,  0,   0)
-Mic1 = ( 50, 50, 100)
-Mic2 = (-50, 50, 100)
-```
-
-其中 Mic1/Mic2 坐标应做成可配置项，方便后续根据结构件实测调整。
-
-推荐新增或维护一个阵列配置头文件，例如：
-
-```text
-main/mic_array_config.h
-```
-
-配置内容示例：
-
-```c
-#define MIC_ARRAY_POS0_MM_X 0.0f
-#define MIC_ARRAY_POS0_MM_Y 0.0f
-#define MIC_ARRAY_POS0_MM_Z 0.0f
-
-#define MIC_ARRAY_POS1_MM_X 50.0f
-#define MIC_ARRAY_POS1_MM_Y 50.0f
-#define MIC_ARRAY_POS1_MM_Z 100.0f
-
-#define MIC_ARRAY_POS2_MM_X -50.0f
-#define MIC_ARRAY_POS2_MM_Y 50.0f
-#define MIC_ARRAY_POS2_MM_Z 100.0f
-```
-
-### 4.2 镜像解与约束
-
-3 个麦克风必然共面，因此 3D 方向解算存在镜像解。当前布局的麦克风平面为：
-
-```text
-z = 2y
-```
-
-镜像不是简单的 `z 正/负`，而是绕这个倾斜平面翻转。
-
-实际机器人使用场景可以使用先验约束降低误判：
-
-- 人声大概率来自机器人外部。
-- 人声大概率比三个麦克风高，即 `elevation > 0`。
-- 人声大概率在机器人前方，即优先 `y > 0`。
-- 限制合理角度范围，例如 `azimuth -150°~+150°`、`elevation 0°~70°`。
-- 使用上一帧方向做连续性约束。
-- 使用三路 raw RMS 做强度辅助评分，但不要单独依赖强度判断。
-
-### 4.3 可选 4 麦扩展
-
-如果后续硬件允许，非共面 4 麦可以显著改善 3D 方向稳定性并降低镜像歧义。
-
-示例布局：
-
-```text
-Mic0 = ( 40,   0,  0)
-Mic1 = (-40,   0,  0)
-Mic2 = (  0,  40, 40)
-Mic3 = (  0, -40, 40)
-```
-
-注意：如果使用 4 个 INMP441，通常需要 I2S0 采两路、I2S1 采两路，并且必须处理 I2S0/I2S1 样本级同步和固定延迟校准。
-
-## 5. 硬件连接
-
-### 5.1 2 麦 I2S0 调试模式
-
-用于快速验证音频链路是否正常：
-
-```text
-GPIO4 -> 两个 INMP441 SCK/BCLK
-GPIO5 -> 两个 INMP441 WS/LRCLK
-GPIO6 -> 两个 INMP441 SD/DOUT
-3V3   -> 两个 INMP441 VDD
-GND   -> 两个 INMP441 GND
-
-Mic0 L/R -> GND   左声道
-Mic1 L/R -> 3V3   右声道
-```
-
-此模式只使用 I2S0，两个通道天然样本对齐，适合先排查 UAC、INMP441 和 I2S 数据格式。
-
-### 5.2 3 麦目标模式
-
-```text
-GPIO4 -> 三个 INMP441 SCK/BCLK
-GPIO5 -> 三个 INMP441 WS/LRCLK
-
-Mic0 SD -> GPIO6
-Mic0 L/R -> GND
-
-Mic1 SD -> GPIO6
-Mic1 L/R -> 3V3
-
-Mic2 SD -> GPIO7
-Mic2 L/R -> GND
-
-3V3 -> 三个 INMP441 VDD
-GND -> 三个 INMP441 GND
-```
-
-说明：
-
-- GPIO6 是 I2S0 数据输入，承载 Mic0/Mic1 的 left/right slot。
-- GPIO7 是 I2S1 数据输入，承载 Mic2 的 left slot。
-- Mic2 的 `L/R` 必须接 GND，因为当前代码读取 I2S1 左声道。
-- I2S1 必须使用 I2S0 的 BCLK/WS，且需要启动后 flush 和固定延迟校准。
-
-### 5.3 USB 口说明
-
-```text
-ESP32-S3 原生 USB:
-  D- = GPIO19
-  D+ = GPIO20
-  功能 = TinyUSB UAC + CDC 业务复合设备
-
-USB-UART 调试口:
-  常见为 GPIO43/GPIO44
-  功能 = 烧录、monitor、ESP_LOG 调试输出
-```
-
-## 6. 软件模块结构
-
-```text
 walle_ear_s3/
 ├── CMakeLists.txt
-├── partitions.csv
 ├── sdkconfig.defaults
-├── readme.md
+├── README.md
 └── main/
     ├── CMakeLists.txt
-    ├── main.c
-    ├── i2s_mic_driver.c / .h      # I2S0/I2S1 raw mic 采集与通道交织
-    ├── afe_processor.c / .h       # UAC 音频选择、TDOA 方向解算、CDC 输出
-    ├── usb_composite.c / .h       # 原生 USB TinyUSB UAC + CDC 业务复合设备
-    ├── tusb_config.h              # TinyUSB 编译期配置
-    └── mic_array_config.h         # 建议新增：麦克风坐标和角度约束配置
+    ├── main.c                    # 系统初始化
+    ├── i2s_mic_driver.c/.h       # I2S 双外设驱动，4 通道采集
+    ├── mic_array_config.h        # 麦克风坐标与 mic pair 定义
+    ├── afe_processor.c/.h        # TDOA 定位 + UAC 音频 + CDC 上报
+    ├── usb_composite.c/.h        # TinyUSB UAC+CDC 复合设备
+    └── tusb_config.h             # TinyUSB 编译期配置
 ```
 
-## 7. 模块职责
+---
 
-### 7.1 i2s_mic_driver
+## 配置说明
 
-职责：
+所有可配置参数集中在以下文件中：
 
-- 使用 ESP-IDF 5.x `driver/i2s_std.h`。
-- 采样率 `16000 Hz`。
-- INMP441 物理输出使用 32-bit slot。
-- 将 32-bit raw sample 转换为 16-bit PCM。
-- 输出 interleaved PCM：
+| 配置文件 | 主要内容 |
+|----------|----------|
+| `main/mic_array_config.h` | 麦克风坐标 (X/Y/Z mm)、声速、mic pair 组合 |
+| `main/i2s_mic_driver.h` | 采样率、位宽、每帧采样数、麦克风数量 |
+| `main/afe_processor.c` | TDOA 门限、CDC 上报间隔、UAC 音源选择 |
+| `main/tusb_config.h` | USB 描述符参数、UAC 端点大小 |
 
-```text
-2 麦模式: [Mic0, Mic1, Mic0, Mic1, ...]
-3 麦模式: [Mic0, Mic1, Mic2, Mic0, Mic1, Mic2, ...]
+---
+
+## 定位算法
+
+### 数据流
+
+```
+4×INMP441 → I2S DMA → Frame Pool (512 samples/ch × 4ch)
+                          │
+            ┌─────────────┼─────────────┐
+            ▼                           ▼
+    TDOA 互相关 × 6 对              UAC 单路上传
+            │                     (Mic0 raw PCM)
+            ▼
+   3×3 最小二乘求解 (vx, vy, vz)
+            │
+            ▼
+     azimuth / elevation
+            │
+            ▼
+      CDC 每秒 JSON 输出
 ```
 
-注意：3 麦模式下，I2S0/I2S1 跨外设采集，需要验证样本级对齐。
+### 算法要点
 
-### 7.2 afe_processor
-
-职责：
-
-- 从 `i2s_mic_driver` 获取 raw mic frame。
-- UAC 只输出 1 路音频：默认 Mic0 raw PCM，后续可切换到 AFE 输出。
-- TDOA 使用 raw Mic0/Mic1/Mic2 做互相关延迟估计。
-- 输出 `azimuth/elevation/confidence` 到 CDC。
-- AFE 仅作为可选 1/2 麦降噪增强模块，不作为 3 麦定位核心。
-
-推荐 CDC 输出格式：
-
-```text
-az:-32,el:18,conf:76
-```
-
-其中：
-
-- `az` 单位为度，范围 `-180~+180`。
-- `el` 单位为度，范围 `-90~+90`。
-- `conf` 范围 `0~100`。
-
-### 7.3 usb_composite
-
-职责：
-
-- 在 ESP32-S3 原生 USB 口枚举复合设备。
-- UAC：单声道、16kHz、16-bit PCM microphone。
-- CDC：业务数据串口，用于发送方向数据。
-- 不负责 ESP-IDF 默认日志输出。
-
-## 8. 调试建议
-
-### 8.1 推荐调试顺序
-
-1. 只接 2 个麦克风，验证 I2S0 + UAC 音频清晰。
-2. 切换 UAC raw mic index，分别确认 Mic0/Mic1 都正常。
-3. 接入 Mic2，进入 3 麦 raw 测试模式，确认 I2S1 不 timeout。
-4. 通过日志查看三路 min/max/rms，确认 Mic2 有有效波形。
-5. 做 I2S0/I2S1 固定延迟校准。
-6. 开启 TDOA，输出 azimuth/elevation/confidence。
-7. 最后再决定是否启用 AFE 输出音频。
-
-### 8.2 常见问题判断
-
-- UAC 有声音但 CDC 没日志：CDC 只发业务数据，不是 `ESP_LOG`。
-- 原生 USB 口能识别麦克风但看不到 boot log：正常，boot log 默认走 USB-UART。
-- USB-UART 口能看日志但识别不到麦克风：正常，该口不是原生 USB OTG。
-- 3 麦模式 I2S1 timeout：优先检查 GPIO7、Mic2 L/R、BCLK/WS 共享和 I2S1 slave 时钟输入。
-- 3 麦定位飘：优先检查 I2S0/I2S1 固定采样偏移、麦克风坐标、阵列开孔遮挡和室内反射。
-
-## 9. 构建要求
-
-- ESP-IDF 5.x。
-- 目标芯片：ESP32-S3。
-- 建议开启 PSRAM，用于音频 buffer 和 esp-sr 内存。
-- TinyUSB 开启 Audio + CDC。
-- 开发日志默认保留在 USB-UART console。
-
-典型命令：
-
-```powershell
-idf.py set-target esp32s3
-idf.py build flash monitor
-```
+- **6 对互相关**：C(4,2) = 6 对麦克风全部参与计算，每对执行 33 个 lag 位置的归一化互相关 + 抛物线亚采样插值
+- **3×3 正规方程**：6 个方程 → AᵀA 压缩为 3×3 对称正定矩阵，伴随矩阵法闭式求逆
+- **远场平面波**：假设声源距离远大于阵列孔径，方向向量为归一化最小二乘解
+- **非共面阵列**：Mic3 不在 Mic0/Mic1/Mic2 所在平面，3D 解唯一，无需镜面消歧先验
