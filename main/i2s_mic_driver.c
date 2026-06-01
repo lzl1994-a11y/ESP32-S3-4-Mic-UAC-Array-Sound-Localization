@@ -31,7 +31,7 @@
 #define I2S_STARTUP_FLUSH_FRAMES 3
 #define I2S_CAPTURE_LOG_FRAMES 4
 #define I2S_USE_SECOND_PORT (MIC_COUNT > 2)
-#define INMP441_32_TO_16_SHIFT 14
+#define INMP441_32_TO_16_SHIFT 16
 
 static const char *TAG = "i2s_mic";
 
@@ -157,7 +157,7 @@ static esp_err_t read_raw_i2s_frame(TickType_t ticks_to_wait,
                                     size_t *bytes_read0_out,
                                     size_t *bytes_read1_out)
 {
-    size_t bytes_read0 = 0;
+/*     size_t bytes_read0 = 0;
     size_t bytes_read1 = 0;
     esp_err_t ret0 = i2s_channel_read(s_i2s0_rx,
                                       s_i2s0_raw,
@@ -174,6 +174,22 @@ static esp_err_t read_raw_i2s_frame(TickType_t ticks_to_wait,
                                       s_i2s_read_bytes,
                                       &bytes_read1,
                                       i2s1_wait);
+#else**/
+
+    size_t bytes_read0 = 0;
+    size_t bytes_read1 = 0;
+    esp_err_t ret0 = i2s_channel_read(s_i2s0_rx,
+                                      s_i2s0_raw,
+                                      s_i2s_read_bytes,
+                                      &bytes_read0,
+                                      ticks_to_wait);
+#if I2S_USE_SECOND_PORT
+    // 直接使用相同的 ticks_to_wait，确保不会因为轻微错位而被掐断
+    esp_err_t ret1 = i2s_channel_read(s_i2s1_rx,
+                                      s_i2s1_raw,
+                                      s_i2s_read_bytes,
+                                      &bytes_read1,
+                                      ticks_to_wait);
 #else
     esp_err_t ret1 = ESP_OK;
 #endif
@@ -278,15 +294,12 @@ static void i2s_capture_task(void *arg)
             const size_t stereo_idx = i * 2;
             const size_t out_idx = i * MIC_COUNT;
 
-            // I2S0 carries Mic0 (L) and Mic1 (R).
-            frame[out_idx + 0] = inmp441_32_to_16(s_i2s0_raw[stereo_idx + 0]);
-            frame[out_idx + 1] = inmp441_32_to_16(s_i2s0_raw[stereo_idx + 1]);
-
-#if I2S_USE_SECOND_PORT
-            // I2S1 carries Mic2 (L) and Mic3 (R), distinct DATA pin shared by L/R SELECT.
-            frame[out_idx + 2] = second_port_valid ? inmp441_32_to_16(s_i2s1_raw[stereo_idx + 0]) : 0;
-            frame[out_idx + 3] = second_port_valid ? inmp441_32_to_16(s_i2s1_raw[stereo_idx + 1]) : 0;
-#endif
+            // I2S1 carries Mic0 (L) and Mic1 (R).
+            // I2S0 carries Mic2 (L) and Mic3 (R).
+            frame[out_idx + 0] = second_port_valid ? inmp441_32_to_16(s_i2s1_raw[stereo_idx + 0]) : 0;
+            frame[out_idx + 1] = second_port_valid ? inmp441_32_to_16(s_i2s1_raw[stereo_idx + 1]) : 0;
+            frame[out_idx + 2] = inmp441_32_to_16(s_i2s0_raw[stereo_idx + 0]);
+            frame[out_idx + 3] = inmp441_32_to_16(s_i2s0_raw[stereo_idx + 1]);
         }
 
         if (s_captured_frames < I2S_CAPTURE_LOG_FRAMES) {
@@ -324,14 +337,14 @@ static void i2s_capture_task(void *arg)
                      second_port_valid ? (unsigned int)(uint32_t)s_i2s1_raw[0] : 0U,
                      second_port_valid ? (unsigned int)(uint32_t)s_i2s1_raw[1] : 0U
 #else
-                     "captured frame %u: mic0=%d[%d,%d] mic1=%d[%d,%d] raw=%08x/%08x",
+                     "captured frame %u: mic2=%d[%d,%d] mic3=%d[%d,%d] raw=%08x/%08x",
                      (unsigned)(s_captured_frames + 1),
-                     frame[0],
-                     min_v[0],
-                     max_v[0],
-                     frame[1],
-                     min_v[1],
-                     max_v[1],
+                     frame[2],
+                     min_v[2],
+                     max_v[2],
+                     frame[3],
+                     min_v[3],
+                     max_v[3],
                      (unsigned int)(uint32_t)s_i2s0_raw[0],
                      (unsigned int)(uint32_t)s_i2s0_raw[1]
 #endif

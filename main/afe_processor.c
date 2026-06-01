@@ -3,6 +3,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 
 #include "esp_err.h"
@@ -63,11 +64,10 @@ static const mic_position_t s_mic_positions[MIC_COUNT] = {
     {MIC_ARRAY_POS3_MM_X * 0.001f, MIC_ARRAY_POS3_MM_Y * 0.001f, MIC_ARRAY_POS3_MM_Z * 0.001f},
 };
 
-/* All C(N,2) mic pairs for 4-mic TDOA estimation (6 pairs). */
-#define AFE_NUM_MIC_PAIRS 6
+#define AFE_NUM_MIC_PAIRS 2
 static const int s_mic_pairs[AFE_NUM_MIC_PAIRS][2] = {
-    {0, 1}, {0, 2}, {0, 3},
-    {1, 2}, {1, 3}, {2, 3},
+    {0, 1},    /* I2S1 pair: Mic0→Mic1, direction (0, 5, 5) mm, constrains uy+uz */
+    {2, 3},    /* I2S0 pair: Mic2→Mic3, direction (10, 0, 0) mm, constrains ux     */
 };
 
 static TaskHandle_t s_audio_task;
@@ -79,9 +79,6 @@ static afe_source_position_t s_latest_position = {
     .azimuth_deg = -1,
 };
 static uint32_t s_position_sequence;
-static float s_latest_azimuth;
-static float s_latest_elevation;
-static bool s_position_valid;
 static bool s_initialized;
 static bool s_started;
 
@@ -119,56 +116,9 @@ static mic_position_t vec_sub(mic_position_t a, mic_position_t b)
     };
 }
 
-static mic_position_t vec_add(mic_position_t a, mic_position_t b)
-{
-    return (mic_position_t) {
-        .x = a.x + b.x,
-        .y = a.y + b.y,
-        .z = a.z + b.z,
-    };
-}
-
-static mic_position_t vec_scale(mic_position_t v, float scale)
-{
-    return (mic_position_t) {
-        .x = v.x * scale,
-        .y = v.y * scale,
-        .z = v.z * scale,
-    };
-}
-
-static float vec_dot(mic_position_t a, mic_position_t b)
-{
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-
-static mic_position_t vec_cross(mic_position_t a, mic_position_t b)
-{
-    return (mic_position_t) {
-        .x = a.y * b.z - a.z * b.y,
-        .y = a.z * b.x - a.x * b.z,
-        .z = a.x * b.y - a.y * b.x,
-    };
-}
-
-static float vec_norm_sq(mic_position_t v)
-{
-    return vec_dot(v, v);
-}
-
 static float vec_norm(mic_position_t v)
 {
-    return sqrtf(vec_norm_sq(v));
-}
-
-static bool vec_normalize(mic_position_t *v)
-{
-    float norm = vec_norm(*v);
-    if (norm < 1e-6f) {
-        return false;
-    }
-    *v = vec_scale(*v, 1.0f / norm);
-    return true;
+    return sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
 }
 
 static float direction_azimuth_deg(float ux, float uy)
@@ -204,21 +154,17 @@ static void publish_invalid_position(void)
         .confidence = 0,
     };
     publish_source_position(position);
-
-    portENTER_CRITICAL(&s_position_lock);
-    s_position_valid = false;
-    portEXIT_CRITICAL(&s_position_lock);
 }
 
 static int max_tdoa_lag_samples(void)
 {
     float max_distance = 0.0f;
-    for (int a = 0; a < MIC_COUNT; ++a) {
-        for (int b = a + 1; b < MIC_COUNT; ++b) {
-            float distance = vec_norm(vec_sub(s_mic_positions[b], s_mic_positions[a]));
-            if (distance > max_distance) {
-                max_distance = distance;
-            }
+    for (int p = 0; p < AFE_NUM_MIC_PAIRS; ++p) {
+        const int a = s_mic_pairs[p][0];
+        const int b = s_mic_pairs[p][1];
+        const float distance = vec_norm(vec_sub(s_mic_positions[b], s_mic_positions[a]));
+        if (distance > max_distance) {
+            max_distance = distance;
         }
     }
 
@@ -343,144 +289,73 @@ static float delay_to_distance(float delay_samples)
     return -AFE_SPEED_OF_SOUND_MPS * delay_samples / (float)I2S_MIC_SAMPLE_RATE_HZ;
 }
 
-static float tdoa_residual(mic_position_t direction, int mic_a, int mic_b, float delay_samples)
-{
-    mic_position_t row = vec_sub(s_mic_positions[mic_b], s_mic_positions[mic_a]);
-    return vec_dot(row, direction) - delay_to_distance(delay_samples);
-}
-
 /*
- * 3×3 symmetric positive-definite linear system solver.
- * Solves A * x = b where A is given by its upper-triangular entries (a11,a12,a13,a22,a23,a33).
- * Uses closed-form adjugate matrix inversion — no LU decomposition overhead,
- * numerically adequate for the well-conditioned mic-array geometry.
+ * Dual-axis independent TDOA solver.
  *
- * x = A⁻¹ * b, with A⁻¹ = adj(A) / det(A).
+ * Layout:
+ *   I2S1 pair (Mic0→Mic1): r = (0, 5, 5) mm →  5e-3·(uy + uz) = d₀ → uy + uz = d₀ / 5e-3
+ *   I2S0 pair (Mic2→Mic3): r = (10, 0, 0) mm → 10e-3·ux = d₁          → ux = d₁ / 10e-3
+ *
+ * Each pair runs on its own BCLK; no cross-port correlation needed.
+ *
+ * Combined with the unit-vector constraint ux² + uy² + uz² = 1, we obtain a
+ * quadratic with two roots — the yz-swapped pair:
+ *   Candidate A: (uy_true, uz_true)
+ *   Candidate B: (uz_true, uy_true)
+ *
+ * Selection: uy > uz is preferred (horiz. component dominates at typical
+ * robot-to-human distances).  If |uy − uz| > 0.3 (very close / high elevation),
+ * the frame is rejected to avoid large azimuth errors.
  */
-static bool solve_3x3_symmetric(float a11, float a12, float a13,
-                                float a22, float a23, float a33,
-                                float b1, float b2, float b3,
-                                float *x1, float *x2, float *x3)
+static bool solve_dual_axis(const float delays[AFE_NUM_MIC_PAIRS],
+                            const float corrs[AFE_NUM_MIC_PAIRS],
+                            float *out_ux, float *out_uy, float *out_uz,
+                            float *out_confidence)
 {
-    /* Compute cofactors of the symmetric matrix A:
-     *      [a11 a12 a13]
-     *  A = [a12 a22 a23]
-     *      [a13 a23 a33]
+    const float s = delay_to_distance(delays[0]) / 0.005f;   /* s = uy + uz */
+    const float ux = delay_to_distance(delays[1]) / 0.010f;  /* ux         */
+
+    const float sq_norm = ux * ux;
+    if (sq_norm > 1.0f) {
+        return false;
+    }
+    const float right = 1.0f - sq_norm;
+
+    /*
+     * uy² + (s − uy)² = right
+     *   →  2·uy² − 2·s·uy + (s² − right) = 0
+     * Δ = 4·s² − 8·(s² − right) = 4·(2·right − s²) = 4·(uy−uz)²
      */
-    const float c11 = a22 * a33 - a23 * a23;
-    const float c12 = a13 * a23 - a12 * a33;  /* = c21 */
-    const float c13 = a12 * a23 - a13 * a22;  /* = c31 */
-    const float c22 = a11 * a33 - a13 * a13;
-    const float c23 = a13 * a12 - a11 * a23;  /* = c32 */
-    const float c33 = a11 * a22 - a12 * a12;
+    const float disc = 2.0f * right - s * s;   /* = (uy − uz)² */
+    if (disc < 0.0f) {
+        return false;
+    }
+    const float delta = sqrtf(disc);
 
-    /* det(A) = a11*c11 + a12*c12 + a13*c13 (expansion along first row) */
-    const float det = a11 * c11 + a12 * c12 + a13 * c13;
-
-    if (fabsf(det) < 1e-12f) {
+    /*
+     * Ambiguity guard: if the horizontal and vertical components differ too
+     * much, both candidates are plausible and we cannot safely choose one.
+     */
+    if (delta > 0.30f) {
         return false;
     }
 
-    const float inv_det = 1.0f / det;
+    const float uy_a = 0.5f * (s + delta);
+    const float uz_a = 0.5f * (s - delta);
+    const float uy_b = 0.5f * (s - delta);
+    const float uz_b = 0.5f * (s + delta);
 
-    /* x = (1/det) * adj(A) * b = (1/det) * C^T * b
-     * Since C is symmetric (C^T = C):  */
-    *x1 = (c11 * b1 + c12 * b2 + c13 * b3) * inv_det;
-    *x2 = (c12 * b1 + c22 * b2 + c23 * b3) * inv_det;
-    *x3 = (c13 * b1 + c23 * b2 + c33 * b3) * inv_det;
+    const float uy = (fabsf(uy_a) >= fabsf(uz_a)) ? uy_a : uy_b;
+    const float uz = (fabsf(uy_a) >= fabsf(uz_a)) ? uz_a : uz_b;
 
-    return true;
-}
+    const float corr_score = clampf(0.5f * (corrs[0] + corrs[1]), 0.0f, 1.0f);
+    const float ambig_score = 1.0f - delta;
+    const float confidence = corr_score * ambig_score * 100.0f;
 
-/*
- * 3D far-field direction-of-arrival via over-determined least-squares.
- *
- * For each mic pair (a,b):
- *   (pos_b - pos_a) · direction = delay_ab * speed_of_sound / sample_rate
- *
- * This yields N (=6 for 4-mic) equations in 3 unknowns (direction x,y,z).
- * The normal equations AᵀA·d = Aᵀb form a 3×3 symmetric positive-definite
- * system solved in closed form.
- *
- * With non-coplanar mics the system has a unique solution — no mirror
- * ambiguity.  The unit-vector constraint ‖d‖=1 is enforced by normalisation
- * of the least-squares result, which is the maximum-likelihood estimate
- * under Gaussian i.i.d. TDOA noise.
- */
-static bool solve_far_field_vector(const float delays[AFE_NUM_MIC_PAIRS],
-                                   float *ux, float *uy, float *uz,
-                                   float *residual_norm)
-{
-    /* Accumulate AᵀA (3×3 symmetric, stored as 6 floats) and Aᵀb (3×1). */
-    float a11 = 0.0f, a12 = 0.0f, a13 = 0.0f;
-    float a22 = 0.0f, a23 = 0.0f, a33 = 0.0f;
-    float atb1 = 0.0f, atb2 = 0.0f, atb3 = 0.0f;
-
-    for (int p = 0; p < AFE_NUM_MIC_PAIRS; ++p) {
-        const int a = s_mic_pairs[p][0];
-        const int b = s_mic_pairs[p][1];
-
-        /* Row vector: r = pos_b - pos_a */
-        const mic_position_t r = vec_sub(s_mic_positions[b], s_mic_positions[a]);
-        const float target = delay_to_distance(delays[p]);
-
-        a11 += r.x * r.x;
-        a12 += r.x * r.y;
-        a13 += r.x * r.z;
-        a22 += r.y * r.y;
-        a23 += r.y * r.z;
-        a33 += r.z * r.z;
-
-        atb1 += r.x * target;
-        atb2 += r.y * target;
-        atb3 += r.z * target;
-    }
-
-    float dx = 0.0f, dy = 0.0f, dz = 0.0f;
-    if (!solve_3x3_symmetric(a11, a12, a13, a22, a23, a33,
-                             atb1, atb2, atb3,
-                             &dx, &dy, &dz)) {
-        return false;
-    }
-
-    /* The algebraic solution's magnitude is a quality indicator:
-     * if it substantially exceeds 1, TDOAs are inconsistent. */
-    const float norm_sq = dx * dx + dy * dy + dz * dz;
-    if (norm_sq > 2.25f) {
-        return false;
-    }
-
-    mic_position_t direction = {dx, dy, dz};
-    if (!vec_normalize(&direction)) {
-        return false;
-    }
-
-    /* Compute normalised residual across all pairs. */
-    float residual_sum_sq = 0.0f;
-    for (int p = 0; p < AFE_NUM_MIC_PAIRS; ++p) {
-        const int a = s_mic_pairs[p][0];
-        const int b = s_mic_pairs[p][1];
-        const float r = tdoa_residual(direction, a, b, delays[p]);
-        residual_sum_sq += r * r;
-    }
-
-    float max_distance = 0.0f;
-    for (int a = 0; a < MIC_COUNT; ++a) {
-        for (int b = a + 1; b < MIC_COUNT; ++b) {
-            float d = vec_norm(vec_sub(s_mic_positions[b], s_mic_positions[a]));
-            if (d > max_distance) {
-                max_distance = d;
-            }
-        }
-    }
-    if (max_distance < 1e-6f) {
-        return false;
-    }
-    *residual_norm = sqrtf(residual_sum_sq / (float)AFE_NUM_MIC_PAIRS) / max_distance;
-
-    *ux = direction.x;
-    *uy = direction.y;
-    *uz = direction.z;
+    *out_ux = ux;
+    *out_uy = uy;
+    *out_uz = uz;
+    *out_confidence = confidence;
     return true;
 }
 
@@ -490,11 +365,6 @@ static void update_source_position(const int16_t *interleaved_frame)
         publish_invalid_position();
         return;
     }
-
-#if MIC_COUNT < 4
-    publish_invalid_position();
-    return;
-#endif
 
     if (frame_rms(interleaved_frame) < AFE_TDOA_MIN_RMS) {
         publish_invalid_position();
@@ -506,7 +376,6 @@ static void update_source_position(const int16_t *interleaved_frame)
         means[mic] = channel_mean(interleaved_frame, mic);
     }
 
-    /* Compute TDOA for all C(4,2)=6 mic pairs via cross-correlation. */
     float delays[AFE_NUM_MIC_PAIRS] = {0};
     float corrs[AFE_NUM_MIC_PAIRS] = {0};
 
@@ -520,24 +389,13 @@ static void update_source_position(const int16_t *interleaved_frame)
         }
     }
 
-    float ux = 0.0f;
-    float uy = 0.0f;
-    float uz = 0.0f;
-    float residual = 0.0f;
-    if (!solve_far_field_vector(delays, &ux, &uy, &uz, &residual)) {
+    float ux, uy, uz, confidence;
+    if (!solve_dual_axis(delays, corrs, &ux, &uy, &uz, &confidence)) {
         publish_invalid_position();
         return;
     }
 
-    /* Average correlation across all pairs for confidence scoring. */
-    float corr_sum = 0.0f;
-    for (int p = 0; p < AFE_NUM_MIC_PAIRS; ++p) {
-        corr_sum += corrs[p];
-    }
-    const float corr_score = clampf(corr_sum / (float)AFE_NUM_MIC_PAIRS, 0.0f, 1.0f);
-    const float residual_score = clampf(1.0f - residual * 4.0f, 0.0f, 1.0f);
-    const int confidence = float_to_int_round(corr_score * residual_score * 100.0f);
-    if (confidence < AFE_TDOA_MIN_CONFIDENCE) {
+    if (confidence < (float)AFE_TDOA_MIN_CONFIDENCE) {
         publish_invalid_position();
         return;
     }
@@ -552,16 +410,9 @@ static void update_source_position(const int16_t *interleaved_frame)
         .z_milli = float_to_int_round(uz * AFE_UNIT_VECTOR_SCALE),
         .azimuth_deg = float_to_int_round(azimuth),
         .elevation_deg = float_to_int_round(elevation),
-        .confidence = confidence,
+        .confidence = float_to_int_round(confidence),
     };
     publish_source_position(position);
-
-    /* Update float globals for CDC JSON reporting. */
-    portENTER_CRITICAL(&s_position_lock);
-    s_latest_azimuth = azimuth;
-    s_latest_elevation = elevation;
-    s_position_valid = true;
-    portEXIT_CRITICAL(&s_position_lock);
 }
 
 static TickType_t uac_write_timeout_ticks(size_t byte_len)
@@ -581,13 +432,6 @@ static void write_uac_audio(const int16_t *data, size_t byte_len, const char *la
         return;
     }
 
-    /*
-     * Write the entire frame in one go.  usb_composite_uac_write() calls
-     * tud_audio_write() internally and already handles pacing: it delays
-     * 1 ms only when the SW FIFO is full, and retries until timeout.
-     * Removing the outer per-chunk vTaskDelay avoids doubling the latency
-     * and keeps the audio pipeline within the 32 ms real-time budget.
-     */
     esp_err_t ret = usb_composite_uac_write(data, byte_len, uac_write_timeout_ticks(byte_len));
     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
         ESP_LOGW(TAG, "UAC write %s failed: %s, total_bytes=%u",
@@ -641,9 +485,6 @@ static void audio_capture_task(void *arg)
             continue;
         }
 
-        // TDOA direction estimation runs before UAC write so its CPU
-        // cost is absorbed by the I2S DMA buffer fill period rather than
-        // starving the USB SW FIFO.
         update_source_position(capture_buffer);
 
 #if AFE_UAC_AUDIO_SOURCE == AFE_UAC_SOURCE_RAW_MIC
@@ -674,19 +515,16 @@ static void cdc_report_task(void *arg)
         int len = 0;
 
         portENTER_CRITICAL(&s_position_lock);
-        bool valid = s_position_valid;
-        float azi = s_latest_azimuth;
-        float ele = s_latest_elevation;
+        bool valid = s_latest_position.valid;
+        int azi = s_latest_position.azimuth_deg;
+        int ele = s_latest_position.elevation_deg;
+        int conf = s_latest_position.confidence;
         portEXIT_CRITICAL(&s_position_lock);
 
         if (valid) {
-            len = snprintf(line,
-                           sizeof(line),
-                           "{\"azi\":%.1f,\"ele\":%.1f}\n",
-                           (double)azi,
-                           (double)ele);
+            len = snprintf(line, sizeof(line), "azi:%d,ele:%d,conf:%d\r\n", azi, ele, conf);
         } else {
-            len = snprintf(line, sizeof(line), "{\"azi\":null,\"ele\":null}\n");
+            len = snprintf(line, sizeof(line), "azi:null,ele:null,conf:0\r\n");
         }
 
         esp_err_t cdc_ret = ESP_ERR_INVALID_SIZE;
