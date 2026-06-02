@@ -5,10 +5,12 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "esp_err.h"
 #include "esp_heap_caps.h"
 #include "esp_log.h"
+#include "esp_vad.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "i2s_mic_driver.h"
@@ -20,10 +22,15 @@
 #define AUDIO_TASK_PRIORITY 9
 #define AUDIO_TASK_CORE 1
 #define AFE_SPEED_OF_SOUND_MPS 343.2f
-#define AFE_TDOA_MIN_RMS 20.0f
-#define AFE_TDOA_MIN_CORRELATION 0.25f
-#define AFE_TDOA_MIN_CONFIDENCE 15
+#define AFE_TDOA_MIN_RMS 5.0f
+#define AFE_TDOA_MIN_CORRELATION 0.04f
+#define AFE_TDOA_MIN_CONFIDENCE 1
 #define AFE_TDOA_MAX_LAG_SAMPLES 16
+#define AFE_VAD_RING_FRAMES 20
+#define AFE_VAD_LOOKBACK_FRAMES 6
+#define AFE_VAD_FRAME_MS 30
+#define AFE_VAD_FRAME_SAMPLES ((I2S_MIC_SAMPLE_RATE_HZ * AFE_VAD_FRAME_MS) / 1000)
+#define AFE_VAD_TDOA_INTERVAL_FRAMES 5   /* TDOA every 5th frame during speech */
 #define AFE_UNIT_VECTOR_SCALE 1000.0f
 #define AFE_UAC_WRITE_MARGIN_MS 80
 #define AFE_UAC_WRITE_MAX_MS 500
@@ -58,16 +65,16 @@ typedef struct {
 } mic_position_t;
 
 static const mic_position_t s_mic_positions[MIC_COUNT] = {
-    {MIC_ARRAY_POS0_MM_X * 0.001f, MIC_ARRAY_POS0_MM_Y * 0.001f, MIC_ARRAY_POS0_MM_Z * 0.001f},
-    {MIC_ARRAY_POS1_MM_X * 0.001f, MIC_ARRAY_POS1_MM_Y * 0.001f, MIC_ARRAY_POS1_MM_Z * 0.001f},
-    {MIC_ARRAY_POS2_MM_X * 0.001f, MIC_ARRAY_POS2_MM_Y * 0.001f, MIC_ARRAY_POS2_MM_Z * 0.001f},
-    {MIC_ARRAY_POS3_MM_X * 0.001f, MIC_ARRAY_POS3_MM_Y * 0.001f, MIC_ARRAY_POS3_MM_Z * 0.001f},
+    {MIC_ARRAY_POS0_MM_X, MIC_ARRAY_POS0_MM_Y, MIC_ARRAY_POS0_MM_Z},
+    {MIC_ARRAY_POS1_MM_X, MIC_ARRAY_POS1_MM_Y, MIC_ARRAY_POS1_MM_Z},
+    {MIC_ARRAY_POS2_MM_X, MIC_ARRAY_POS2_MM_Y, MIC_ARRAY_POS2_MM_Z},
+    {MIC_ARRAY_POS3_MM_X, MIC_ARRAY_POS3_MM_Y, MIC_ARRAY_POS3_MM_Z},
 };
 
 #define AFE_NUM_MIC_PAIRS 2
 static const int s_mic_pairs[AFE_NUM_MIC_PAIRS][2] = {
-    {0, 1},    /* I2S1 pair: Mic0→Mic1, direction (0, 5, 5) mm, constrains uy+uz */
-    {2, 3},    /* I2S0 pair: Mic2→Mic3, direction (10, 0, 0) mm, constrains ux     */
+    {0, 1},    /* Mic0→Mic1  (I2S1), direction (70, 0, 0) mm  → constrains ux     */
+    {2, 3},    /* Mic2→Mic3  (I2S0), direction (0, 30, 30) mm → constrains uy+uz  */
 };
 
 static TaskHandle_t s_audio_task;
@@ -81,6 +88,12 @@ static afe_source_position_t s_latest_position = {
 static uint32_t s_position_sequence;
 static bool s_initialized;
 static bool s_started;
+static vad_handle_t s_vad_handle;
+static int16_t **s_ring_buffer;
+static int s_ring_write_idx;
+static int s_ring_count;
+static bool s_vad_speech_active;
+static int s_speech_frame_count;          /* frames since speech onset, for periodic TDOA */
 
 static void *audio_calloc(size_t count, size_t size)
 {
@@ -156,15 +169,57 @@ static void publish_invalid_position(void)
     publish_source_position(position);
 }
 
+static int find_peak_ring_frame(int window_frames)
+{
+    int best_idx = -1;
+    float best_rms = 0.0f;
+
+    const int available = (s_ring_count < AFE_VAD_RING_FRAMES)
+                          ? s_ring_count : AFE_VAD_RING_FRAMES;
+    const int search_frames = (window_frames < available) ? window_frames : available;
+    if (search_frames <= 0) {
+        return -1;
+    }
+
+    for (int f = 0; f < search_frames; ++f) {
+        const int idx = (s_ring_write_idx - 1 - f + AFE_VAD_RING_FRAMES) % AFE_VAD_RING_FRAMES;
+        const size_t total = s_feed_samples_per_channel * MIC_COUNT;
+        uint64_t sum_sq = 0;
+        for (size_t i = 0; i < total; ++i) {
+            int32_t s = s_ring_buffer[idx][i];
+            sum_sq += (uint64_t)(s * s);
+        }
+        const float rms = sqrtf((float)sum_sq / (float)total);
+        if (rms > best_rms) {
+            best_rms = rms;
+            best_idx = idx;
+        }
+    }
+    return best_idx;
+}
+
+static void ring_buffer_push(const int16_t *frame)
+{
+    if (s_ring_write_idx >= AFE_VAD_RING_FRAMES) {
+        s_ring_write_idx = 0;
+    }
+    memcpy(s_ring_buffer[s_ring_write_idx], frame,
+           s_feed_samples_per_channel * MIC_COUNT * sizeof(int16_t));
+    s_ring_write_idx = (s_ring_write_idx + 1) % AFE_VAD_RING_FRAMES;
+    if (s_ring_count < AFE_VAD_RING_FRAMES) {
+        ++s_ring_count;
+    }
+}
+
 static int max_tdoa_lag_samples(void)
 {
     float max_distance = 0.0f;
     for (int p = 0; p < AFE_NUM_MIC_PAIRS; ++p) {
         const int a = s_mic_pairs[p][0];
         const int b = s_mic_pairs[p][1];
-        const float distance = vec_norm(vec_sub(s_mic_positions[b], s_mic_positions[a]));
-        if (distance > max_distance) {
-            max_distance = distance;
+        const float distance_m = vec_norm(vec_sub(s_mic_positions[b], s_mic_positions[a])) * 1e-3f; /* mm→m */
+        if (distance_m > max_distance) {
+            max_distance = distance_m;
         }
     }
 
@@ -290,72 +345,119 @@ static float delay_to_distance(float delay_samples)
 }
 
 /*
- * Dual-axis independent TDOA solver.
+ * General dual-axis TDOA solver.
  *
- * Layout:
- *   I2S1 pair (Mic0→Mic1): r = (0, 5, 5) mm →  5e-3·(uy + uz) = d₀ → uy + uz = d₀ / 5e-3
- *   I2S0 pair (Mic2→Mic3): r = (10, 0, 0) mm → 10e-3·ux = d₁          → ux = d₁ / 10e-3
+ * For each mic pair p with direction vector rₚ = pos[b] − pos[a]:
+ *   d̂ₚ·u = delay_to_distance(τₚ) / |rₚ|
  *
- * Each pair runs on its own BCLK; no cross-port correlation needed.
+ * Together with |u| = 1, solve for the source unit vector u = (ux, uy, uz).
+ * No hardcoded layout assumptions — auto-adapts to s_mic_positions.
  *
- * Combined with the unit-vector constraint ux² + uy² + uz² = 1, we obtain a
- * quadratic with two roots — the yz-swapped pair:
- *   Candidate A: (uy_true, uz_true)
- *   Candidate B: (uz_true, uy_true)
- *
- * Selection: uy > uz is preferred (horiz. component dominates at typical
- * robot-to-human distances).  If |uy − uz| > 0.3 (very close / high elevation),
- * the frame is rejected to avoid large azimuth errors.
+ * With the current layout (Pair 0: X-axis 70mm, Pair 1: YZ-plane 42.4mm),
+ * this gives two independent constraints:
+ *   ux = delay_to_distance(τ₀) / 0.070
+ *   0.707·uy + 0.707·uz = delay_to_distance(τ₁) / 0.0424
  */
 static bool solve_dual_axis(const float delays[AFE_NUM_MIC_PAIRS],
                             const float corrs[AFE_NUM_MIC_PAIRS],
                             float *out_ux, float *out_uy, float *out_uz,
                             float *out_confidence)
 {
-    const float s = delay_to_distance(delays[0]) / 0.005f;   /* s = uy + uz */
-    const float ux = delay_to_distance(delays[1]) / 0.010f;  /* ux         */
+    /* Compute normalized direction vectors from actual mic positions */
+    float nx[AFE_NUM_MIC_PAIRS], ny[AFE_NUM_MIC_PAIRS], nz[AFE_NUM_MIC_PAIRS];
+    float proj[AFE_NUM_MIC_PAIRS];
 
-    const float sq_norm = ux * ux;
-    if (sq_norm > 1.0f) {
-        return false;
+    for (int p = 0; p < AFE_NUM_MIC_PAIRS; ++p) {
+        const int a = s_mic_pairs[p][0];
+        const int b = s_mic_pairs[p][1];
+        const float dx = (s_mic_positions[b].x - s_mic_positions[a].x) * 1e-3f; /* mm→m */
+        const float dy = (s_mic_positions[b].y - s_mic_positions[a].y) * 1e-3f;
+        const float dz = (s_mic_positions[b].z - s_mic_positions[a].z) * 1e-3f;
+        const float mag = sqrtf(dx * dx + dy * dy + dz * dz);
+
+        if (mag < 1e-6f) return false;
+        nx[p] = dx / mag;
+        ny[p] = dy / mag;
+        nz[p] = dz / mag;
+        proj[p] = delay_to_distance(delays[p]) / mag;
     }
-    const float right = 1.0f - sq_norm;
 
     /*
-     * uy² + (s − uy)² = right
-     *   →  2·uy² − 2·s·uy + (s² − right) = 0
-     * Δ = 4·s² − 8·(s² − right) = 4·(2·right − s²) = 4·(uy−uz)²
+     * Solve 2×2 linear system for (ux, uy) in terms of uz:
+     *   nx₀·ux + ny₀·uy = proj₀ − nz₀·uz
+     *   nx₁·ux + ny₁·uy = proj₁ − nz₁·uz
      */
-    const float disc = 2.0f * right - s * s;   /* = (uy − uz)² */
+    const float det = nx[0] * ny[1] - nx[1] * ny[0];
+    if (fabsf(det) < 1e-4f) return false;
+
+    /* ux = A + B·uz,  uy = C + D·uz */
+    const float A = (proj[0] * ny[1] - proj[1] * ny[0]) / det;
+    const float B = (nz[1] * ny[0] - nz[0] * ny[1]) / det;
+    const float C = (nx[0] * proj[1] - nx[1] * proj[0]) / det;
+    const float D = (nx[1] * nz[0] - nx[0] * nz[1]) / det;
+
+    /* Quadratic: (B² + D² + 1)·uz² + 2(AB + CD)·uz + (A² + C² − 1) = 0 */
+    const float qa = B * B + D * D + 1.0f;
+    const float qb = 2.0f * (A * B + C * D);
+    const float qc = A * A + C * C - 1.0f;
+
+    const float disc = qb * qb - 4.0f * qa * qc;
     if (disc < 0.0f) {
-        return false;
+        /*
+         * Noisy delay estimates can push the combined projection norm
+         * beyond the unit sphere (proj₀² + proj₁² > 1).  Scale both
+         * projections back to the boundary and recompute.
+         */
+        const float proj_norm_sq = proj[0] * proj[0] + proj[1] * proj[1];
+        if (proj_norm_sq <= 1.0f) {
+            return false;
+        }
+        const float scale = 1.0f / sqrtf(proj_norm_sq);
+        const float p0 = proj[0] * scale;
+        const float p1 = proj[1] * scale;
+
+        const float A2 = (p0 * ny[1] - p1 * ny[0]) / det;
+        const float C2 = (nx[0] * p1 - nx[1] * p0) / det;
+        const float qa2 = B * B + D * D + 1.0f;
+        const float qb2 = 2.0f * (A2 * B + C2 * D);
+        const float qc2 = A2 * A2 + C2 * C2 - 1.0f;
+        const float disc2 = qb2 * qb2 - 4.0f * qa2 * qc2;
+        if (disc2 < 0.0f) return false;
+
+        const float sqrt_disc2 = sqrtf(disc2);
+        const float uz1b = (-qb2 + sqrt_disc2) / (2.0f * qa2);
+        const float uz2b = (-qb2 - sqrt_disc2) / (2.0f * qa2);
+        const float uzb = (uz1b >= uz2b) ? uz1b : uz2b;
+        const float uxb = A2 + B * uzb;
+        const float uyb = C2 + D * uzb;
+
+        const float normb = sqrtf(uxb * uxb + uyb * uyb + uzb * uzb);
+        if (normb < 0.01f) return false;
+
+        *out_ux = uxb / normb;
+        *out_uy = uyb / normb;
+        *out_uz = uzb / normb;
+        *out_confidence = clampf(0.5f * (corrs[0] + corrs[1]), 0.0f, 1.0f) * 100.0f;
+        return true;
     }
-    const float delta = sqrtf(disc);
 
-    /*
-     * Ambiguity guard: if the horizontal and vertical components differ too
-     * much, both candidates are plausible and we cannot safely choose one.
-     */
-    if (delta > 0.30f) {
-        return false;
-    }
+    const float sqrt_disc = sqrtf(disc);
+    const float uz1 = (-qb + sqrt_disc) / (2.0f * qa);
+    const float uz2 = (-qb - sqrt_disc) / (2.0f * qa);
 
-    const float uy_a = 0.5f * (s + delta);
-    const float uz_a = 0.5f * (s - delta);
-    const float uy_b = 0.5f * (s - delta);
-    const float uz_b = 0.5f * (s + delta);
+    /* Pick positive-z root (source is above mic plane) */
+    const float uz = (uz1 >= uz2) ? uz1 : uz2;
+    const float ux = A + B * uz;
+    const float uy = C + D * uz;
 
-    const float uy = (fabsf(uy_a) >= fabsf(uz_a)) ? uy_a : uy_b;
-    const float uz = (fabsf(uy_a) >= fabsf(uz_a)) ? uz_a : uz_b;
+    /* Renormalize to unit length (compensates floating-point drift) */
+    const float norm = sqrtf(ux * ux + uy * uy + uz * uz);
+    if (norm < 0.01f) return false;
 
-    const float corr_score = clampf(0.5f * (corrs[0] + corrs[1]), 0.0f, 1.0f);
-    const float ambig_score = 1.0f - delta;
-    const float confidence = corr_score * ambig_score * 100.0f;
-
-    *out_ux = ux;
-    *out_uy = uy;
-    *out_uz = uz;
-    *out_confidence = confidence;
+    *out_ux = ux / norm;
+    *out_uy = uy / norm;
+    *out_uz = uz / norm;
+    *out_confidence = clampf(0.5f * (corrs[0] + corrs[1]), 0.0f, 1.0f) * 100.0f;
     return true;
 }
 
@@ -366,7 +468,9 @@ static void update_source_position(const int16_t *interleaved_frame)
         return;
     }
 
-    if (frame_rms(interleaved_frame) < AFE_TDOA_MIN_RMS) {
+    const float rms = frame_rms(interleaved_frame);
+    if (rms < AFE_TDOA_MIN_RMS) {
+        ESP_LOGD(TAG, "TDOA skip: rms=%.1f < %.1f", (double)rms, (double)AFE_TDOA_MIN_RMS);
         publish_invalid_position();
         return;
     }
@@ -384,18 +488,28 @@ static void update_source_position(const int16_t *interleaved_frame)
         const int b = s_mic_pairs[p][1];
         if (!estimate_pair_delay_samples(interleaved_frame, a, b, means,
                                          &delays[p], &corrs[p])) {
+            ESP_LOGD(TAG, "TDOA skip: pair%d corr=%.3f < %.3f",
+                     p, (double)corrs[p], (double)AFE_TDOA_MIN_CORRELATION);
             publish_invalid_position();
             return;
         }
     }
 
+    ESP_LOGD(TAG, "TDOA: pair0 corr=%.3f lag=%.2f  pair1 corr=%.3f lag=%.2f  rms=%.1f",
+             (double)corrs[0], (double)delays[0],
+             (double)corrs[1], (double)delays[1],
+             (double)rms);
+
     float ux, uy, uz, confidence;
     if (!solve_dual_axis(delays, corrs, &ux, &uy, &uz, &confidence)) {
+        ESP_LOGD(TAG, "TDOA skip: solve_dual_axis failed");
         publish_invalid_position();
         return;
     }
 
     if (confidence < (float)AFE_TDOA_MIN_CONFIDENCE) {
+        ESP_LOGD(TAG, "TDOA skip: conf=%.1f < %d",
+                 (double)confidence, AFE_TDOA_MIN_CONFIDENCE);
         publish_invalid_position();
         return;
     }
@@ -412,6 +526,10 @@ static void update_source_position(const int16_t *interleaved_frame)
         .elevation_deg = float_to_int_round(elevation),
         .confidence = float_to_int_round(confidence),
     };
+    ESP_LOGI(TAG, "TDOA HIT: azi=%d ele=%d conf=%d corr=[%.3f,%.3f] lag=[%.2f,%.2f]",
+             position.azimuth_deg, position.elevation_deg, position.confidence,
+             (double)corrs[0], (double)corrs[1],
+             (double)delays[0], (double)delays[1]);
     publish_source_position(position);
 }
 
@@ -475,6 +593,16 @@ static void audio_capture_task(void *arg)
         return;
     }
 
+    /* VAD sub-frame buffer: extract Mic0 first 480 samples per 512-sample frame */
+    int16_t *vad_buf = (int16_t *)audio_calloc(AFE_VAD_FRAME_SAMPLES, sizeof(int16_t));
+    if (vad_buf == NULL) {
+        ESP_LOGE(TAG, "VAD buffer alloc failed");
+        free(uac_buffer);
+        free(capture_buffer);
+        vTaskDelete(NULL);
+        return;
+    }
+
     while (true) {
         esp_err_t ret = i2s_mic_driver_read(capture_buffer,
                                             s_feed_samples_per_channel,
@@ -485,7 +613,42 @@ static void audio_capture_task(void *arg)
             continue;
         }
 
-        update_source_position(capture_buffer);
+        /* Store full 4ch frame in ring buffer */
+        ring_buffer_push(capture_buffer);
+
+        /* Extract Mic0 first N samples for VAD (30ms = 480 samples) */
+        for (int i = 0; i < AFE_VAD_FRAME_SAMPLES; ++i) {
+            vad_buf[i] = capture_buffer[i * MIC_COUNT + 0];
+        }
+        vad_state_t vad_state = vad_process(s_vad_handle,
+                                            vad_buf,
+                                            I2S_MIC_SAMPLE_RATE_HZ,
+                                            AFE_VAD_FRAME_MS);
+
+        if (vad_state == VAD_SPEECH) {
+            if (!s_vad_speech_active) {
+                s_vad_speech_active = true;
+                s_speech_frame_count = 0;
+                /* Onset: search ring buffer for peak frame */
+                const int peak_idx = find_peak_ring_frame(AFE_VAD_LOOKBACK_FRAMES);
+                if (peak_idx >= 0) {
+                    ESP_LOGD(TAG, "VAD onset, TDOA on peak frame");
+                    update_source_position(s_ring_buffer[peak_idx]);
+                }
+            } else {
+                /* Periodic TDOA during sustained speech */
+                ++s_speech_frame_count;
+                if (s_speech_frame_count % AFE_VAD_TDOA_INTERVAL_FRAMES == 0) {
+                    update_source_position(capture_buffer);
+                }
+            }
+        } else {
+            if (s_vad_speech_active) {
+                s_vad_speech_active = false;
+                s_speech_frame_count = 0;
+                ESP_LOGD(TAG, "VAD silence");
+            }
+        }
 
 #if AFE_UAC_AUDIO_SOURCE == AFE_UAC_SOURCE_RAW_MIC
         for (size_t i = 0; i < s_feed_samples_per_channel; ++i) {
@@ -519,12 +682,13 @@ static void cdc_report_task(void *arg)
         int azi = s_latest_position.azimuth_deg;
         int ele = s_latest_position.elevation_deg;
         int conf = s_latest_position.confidence;
+        bool vad_active = s_vad_speech_active;
         portEXIT_CRITICAL(&s_position_lock);
 
         if (valid) {
-            len = snprintf(line, sizeof(line), "azi:%d,ele:%d,conf:%d\r\n", azi, ele, conf);
+            len = snprintf(line, sizeof(line), "azi:%d,ele:%d,conf:%d,vad:%d\r\n", azi, ele, conf, vad_active ? 1 : 0);
         } else {
-            len = snprintf(line, sizeof(line), "azi:null,ele:null,conf:0\r\n");
+            len = snprintf(line, sizeof(line), "azi:null,ele:null,conf:0,vad:%d\r\n", vad_active ? 1 : 0);
         }
 
         esp_err_t cdc_ret = ESP_ERR_INVALID_SIZE;
@@ -560,8 +724,43 @@ esp_err_t afe_processor_init(void)
 
     s_feed_samples_per_channel = AUDIO_FRAME_SAMPLES;
     publish_invalid_position();
+
+    /* Allocate ring buffer for VAD lookback */
+    const size_t frame_bytes = s_feed_samples_per_channel * MIC_COUNT * sizeof(int16_t);
+    s_ring_buffer = (int16_t **)audio_calloc(AFE_VAD_RING_FRAMES, sizeof(int16_t *));
+    if (s_ring_buffer == NULL) {
+        ESP_LOGE(TAG, "ring buffer ptr alloc failed");
+        return ESP_ERR_NO_MEM;
+    }
+    for (int i = 0; i < AFE_VAD_RING_FRAMES; ++i) {
+        s_ring_buffer[i] = (int16_t *)audio_calloc(1, frame_bytes);
+        if (s_ring_buffer[i] == NULL) {
+            ESP_LOGE(TAG, "ring buffer frame %d alloc failed", i);
+            return ESP_ERR_NO_MEM;
+        }
+    }
+    s_ring_write_idx = 0;
+    s_ring_count = 0;
+
+    /* Create WebRTC VAD: mode 0 (most sensitive), 16kHz, 30ms frame */
+    s_vad_handle = vad_create_with_param(VAD_MODE_0,
+                                         I2S_MIC_SAMPLE_RATE_HZ,
+                                         AFE_VAD_FRAME_MS,
+                                         128,   /* min speech ms */
+                                         500);  /* min noise ms */
+    if (s_vad_handle == NULL) {
+        ESP_LOGE(TAG, "VAD create failed");
+        return ESP_ERR_NO_MEM;
+    }
+    s_vad_speech_active = false;
+
     s_initialized = true;
 
+    ESP_LOGI(TAG,
+             "VAD + ring buffer ready: ring=%d frames (%u KB), vad=%dms frames",
+             AFE_VAD_RING_FRAMES,
+             (unsigned)((AFE_VAD_RING_FRAMES * frame_bytes) / 1024),
+             AFE_VAD_FRAME_MS);
     ESP_LOGI(TAG,
              "Raw UAC/TDOA pipeline ready: frame=%u samples/ch, capture_channels=%d",
              (unsigned)s_feed_samples_per_channel,

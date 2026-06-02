@@ -21,16 +21,16 @@
 #define MIC_ARRAY_POS2_MM_Z   0.0f
 
 #define MIC_ARRAY_POS3_MM_X   0.0f
-#define MIC_ARRAY_POS3_MM_Y   3.0f
-#define MIC_ARRAY_POS3_MM_Z   3.0f
+#define MIC_ARRAY_POS3_MM_Y   30.0f
+#define MIC_ARRAY_POS3_MM_Z   30.0f
 
-#define MIC_ARRAY_POS0_MM_X  -3.5f
+#define MIC_ARRAY_POS0_MM_X  -35.f
 #define MIC_ARRAY_POS0_MM_Y   0.0f
-#define MIC_ARRAY_POS0_MM_Z   3.5f
+#define MIC_ARRAY_POS0_MM_Z   35.f
 
-#define MIC_ARRAY_POS1_MM_X   3.5f
+#define MIC_ARRAY_POS1_MM_X   35.f
 #define MIC_ARRAY_POS1_MM_Y   0.0f
-#define MIC_ARRAY_POS1_MM_Z   3.5f
+#define MIC_ARRAY_POS1_MM_Z   35.f
 
 /* ---------- Speed of sound (mm/s) ---------- */
 #define SOUND_SPEED_MM_PER_S 343000
