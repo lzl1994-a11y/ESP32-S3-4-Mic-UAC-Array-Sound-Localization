@@ -9,10 +9,13 @@
  *   +Z increases elevation (up).
  *
  * 4-mic dual-axis layout:
- *   I2S1 pair Mic0-Mic1 lies in the YZ plane (constrains uy+uz).
- *   I2S0 pair Mic2-Mic3 lies in the XZ plane (constrains ux).
- *   Each I2S port runs on the same BCLK — intra-port cross-correlation
- *   is reliable without clock-domain bridging artifacts.
+ *   Pair 0 (I2S1): Mic0--Mic1, 70 mm X-axis span, constrains ux.
+ *   Pair 1 (I2S0): Mic2--Mic3, YZ-plane span, constrains uy+uz.
+ *   Each I2S port shares a single BCLK -- intra-port cross-correlation
+ *   is reliable without clock-domain bridging.
+ *
+ * To adapt for your own hardware, edit the six macros below and
+ * update the mic pair assignment in afe_processor.c if needed.
  */
 
 /* ---------- Mic positions (mm) ---------- */
@@ -36,8 +39,11 @@
 #define SOUND_SPEED_MM_PER_S 343000
 
 /*
- * Intra-port mic pairs for dual-axis TDOA.
- * Pair 0 (I2S1): Mic0→Mic1, direction vector (0, 5, 5) mm.
- * Pair 1 (I2S0): Mic2→Mic3, direction vector (10, 0, 0) mm.
+ * Number of intra-port mic pairs for dual-axis TDOA.
+ * Pair 0 (I2S1): Mic0 -> Mic1,  direction (70, 0, 0) mm,  constrains ux.
+ * Pair 1 (I2S0): Mic2 -> Mic3,  direction (0, 30, 30) mm, constrains uy+uz.
+ *
+ * The direction vectors are computed automatically from the positions above
+ * by the general solver in afe_processor.c.  Just keep MIC_PAIR_COUNT at 2.
  */
 #define MIC_PAIR_COUNT 2

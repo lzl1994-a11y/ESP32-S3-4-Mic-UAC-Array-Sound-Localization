@@ -1,244 +1,360 @@
-# Walle Ear S3
+# 🤖 Walle Ear S3
 
-> 基于 ESP32-S3 的 4 麦克风阵列机器人听觉前端  
-> USB 即插即用：UAC 音频流 + CDC 串口实时上报声源方位信息
-
----
-
-## 特性
-
-- **4 路同步采集** — 4 × INMP441 MEMS 麦克风，16kHz / 16bit
-- **双轴独立 TDOA 定位** — 各 I2S 端口内部互相关，无需跨端口时钟域对齐
-- **USB 复合设备** — 单根 USB 线同时提供 UAC 音频和 CDC 串口
+🎤 ESP32-S3 based 4-microphone array auditory front-end for robotics.  
+🔌 Plug-and-play via USB: UAC audio stream + CDC serial real-time
+sound source localization.
 
 ---
 
-## 硬件规格
+## ✨ Features
 
-| 项目 | 参数 |
-|------|------|
-| MCU | ESP32-S3 (160 MHz) |
-| 麦克风 | 4 × INMP441 |
-| 采样率 | 16000 Hz |
-| 位深 | 16-bit signed PCM |
-| USB | 2.0 Full Speed (GPIO19/GPIO20) |
-| I2S | I2S0 × 2ch + I2S1 × 2ch，共享 BCLK/WS 时钟搭桥 |
-
----
-
-## 角度定义
-
-| 角度 | 符号 | 范围 | 零位 | 正向 |
-|------|------|------|------|------|
-| 方位角 Azimuth | θ | −180° ~ +180° | +Y 方向 = 0° | 绕 +Z 轴逆时针 |
-| 仰角 Elevation | φ | −90° ~ +90° | XY 平面 = 0° | +Z 方向为正 |
+| Icon | Feature |
+|---|---|
+| 🎙️ | **4-channel synchronous capture** -- 4x INMP441 MEMS microphones at 16 kHz / 16-bit |
+| 📡 | **Dual-axis independent TDOA** -- intra-port cross-correlation per I2S peripheral, no clock-domain bridging needed |
+| 🗣️ | **WebRTC VAD voice trigger** -- TDOA runs only during speech, reducing false positives |
+| 🧮 | **General TDOA solver** -- automatically adapts to any microphone positions; no hardcoded layout assumptions |
+| 🔌 | **USB composite device** -- single USB cable provides UAC audio input and CDC serial telemetry |
 
 ---
 
-## 麦克风阵列布局
+## 🔧 Hardware Specifications
 
-| Mic | 端口 | X (mm) | Y (mm) | Z (mm) | L/R | 角色 |
-|-----|------|--------|--------|--------|-----|------|
-| 0   | I2S1 | 0      | 0      | 0      | GND | 与 Mic1 成对，约束 uy+uz |
-| 1   | I2S1 | 0      | 5      | 5      | 3V3 | 与 Mic0 成对 |
-| 2   | I2S0 | −5     | 0      | 5      | GND | 与 Mic3 成对，约束 ux |
-| 3   | I2S0 | 5      | 0      | 5      | 3V3 | 与 Mic2 成对 |
-
-坐标可在 `main/mic_array_config.h` 中自定义。
-
----
-
-## 硬件接线
-
-```
-GPIO4  → BCLK → 4×INMP441 SCK
-GPIO5  → WS   → 4×INMP441 WS/LRCLK
-GPIO7  → DIN  → Mic0 SD + Mic1 SD        (I2S1)
-GPIO6  → DIN  → Mic2 SD + Mic3 SD        (I2S0)
-
-Mic0 L/R → GND    (左声道)
-Mic1 L/R → 3V3    (右声道)
-Mic2 L/R → GND    (左声道)
-Mic3 L/R → 3V3    (右声道)
-```
-
-> **时钟搭桥**：I2S0 配置为 Master 输出 BCLK/WS，I2S1 配置为 Slave 输入同一组 BCLK/WS。
+| Item | Specification |
+|---|---|
+| 🧠 MCU | ESP32-S3 (240 MHz, dual-core) |
+| 🎤 Microphones | 4x INMP441 MEMS |
+| 🎵 Sample Rate | 16000 Hz |
+| 📏 Bit Depth | 16-bit signed PCM |
+| 🔌 USB | 2.0 Full Speed (GPIO19/GPIO20) |
+| 🎛️ I2S | I2S0 x 2ch + I2S1 x 2ch, shared BCLK/WS clock bridge |
 
 ---
 
-## 定位原理
+## 📐 Angle Convention
 
-### 核心思路
-
-4 颗麦克风分为两个 I2S 端口各一对。每个端口内的两颗 mic 共享同一个 BCLK——互相关（cross-correlation）在同一时钟域内进行，完全可靠，避免了跨 I2S 端口对因时钟微量漂移和信号路径不对称导致的互相关峰值发散。
-
-每个端口的 mic pair 独立约束方向向量的一个分量：
-
-```
-I2S0 对 (Mic2→Mic3)：方向向量 r₀ = (10, 0, 0) mm
-  → 仅约束 ux
-
-I2S1 对 (Mic0→Mic1)：方向向量 r₁ = (0, 5, 5) mm
-  → 约束 uy + uz
-```
-
-加上单位向量约束 `ux² + uy² + uz² = 1`，三个方程正好解三个未知数。
-
-### 数学推导
-
-令声源方向单位向量为 `u = (ux, uy, uz)`，声速 `c`，采样率 `fs`。
-
-**Step 1 — TDOA 互相关**
-
-对每对 mic `(a, b)`，互相关找到延迟 `τ`（样本数），对应的到达距离差：
-
-```
-d_ab = −c · τ / fs
-```
-
-TDOA 方程：
-
-```
-(r_b − r_a) · u = d_ab
-```
-
-**Step 2 — 直接求解分量**
-
-代入实际坐标：
-
-**I2S0 对 (2,3)**：
-```
-10 · ux = d₀    →    ux = d₀ / 10
-```
-
-**I2S1 对 (0,1)**：
-```
-5 · uy + 5 · uz = d₁    →    uy + uz = d₁ / 5
-```
-
-令 `s = uy + uz`。
-
-`ux` 和 `s` 均由 TDOA 唯一确定（带符号，无歧义）。
-
-**Step 3 — 解二次方程**
-
-从单位向量约束得：
-
-```
-ux² + uy² + (s − uy)² = 1
-2·uy² − 2·s·uy + (s² + ux² − 1) = 0
-```
-
-判别式：
-
-```
-Δ = 4·s² − 8·(s² + ux² − 1) = 4·(2 − 2·ux² − s²) = 4·(uy − uz)²
-```
-
-Δ 恒 ≥ 0，始终有实数解。两根互为 yz 互换：
-
-```
-Candidate A:  uy = (s + δ)/2,   uz = (s − δ)/2      (uy ≥ uz)
-Candidate B:  uy = (s − δ)/2,   uz = (s + δ)/2      (uy ≤ uz)
-```
-
-其中 `δ = |uy − uz| = √(2 − 2·ux² − s²)`。
-
-**Step 4 — 消歧**
-
-在机器人典型使用场景下，声源（人嘴）距离机器人 0.3m 高的麦克风阵列在 1.5m 以外，仰角不超过 30°。此时水平分量 uy 的绝对值远大于垂直分量 uz，候选 A 天然命中。
-
-当 `δ > 0.3`（声源过近 / 仰角过高，两个候选差异显著），本帧拒识。当 `δ ≤ 0.3`，选择 `|uy| ≥ |uz|` 的候选。
-
-**Step 5 — 角度输出**
-
-```
-方位角:  θ = atan2(ux, uy)
-仰角:    φ = atan2(uz, √(ux² + uy²))
-```
-
-### 置信度
-
-```
-corr_score   = (corr_pair0 + corr_pair1) / 2
-ambig_score  = 1 − δ
-confidence   = corr_score × ambig_score × 100
-```
-
-置信度 < 15 时拒绝输出。
-
-### 性能预期
-
-| 距离 | 方位角误差 (az=30°) | 方位角误差 (az=60°) |
-|------|-------------------|-------------------|
-| 0.5 m | ~16° | ~24° |
-| 1.0 m | ~7° | ~13° |
-| 1.5 m | ~4° | ~8° |
-| 2.0 m | ~2° | ~4° |
-| 3.0 m | < 1° | ~2° |
-
-> 近距离高仰角场景（< 1m）由 `δ > 0.3` 拒识门限保护，不输出错误方位角。
+| Angle | Symbol | Range | Zero Reference | Positive Direction |
+|---|---|---|---|---|
+| 🧭 Azimuth | θ | -180° ~ +180° | +Y axis = 0° | Counter-clockwise about +Z |
+| 📈 Elevation | φ | -90° ~ +90° | XY plane = 0° | +Z direction |
 
 ---
 
-## 构建
+## 🎙️ Microphone Array Layout
 
-**前置要求**：ESP-IDF 5.x
+The default 4-mic layout forms two orthogonal baselines for independent
+dual-axis TDOA.  Coordinates are set in `main/mic_array_config.h`.
+
+| Mic | I2S Port | X (mm) | Y (mm) | Z (mm) | L/R Pin | Role |
+|---|---|---|---|---|---|---|
+| 🎤 0 | I2S1 | -35 | 0 | 35 | GND | Pair 0: X-axis baseline (70 mm) |
+| 🎤 1 | I2S1 | +35 | 0 | 35 | 3V3 | Pair 0 |
+| 🎤 2 | I2S0 | 0 | 0 | 0 | GND | Pair 1: YZ-plane baseline |
+| 🎤 3 | I2S0 | 0 | 30 | 30 | 3V3 | Pair 1 |
+
+- **Pair 0 (I2S1, Mic0/Mic1)**: pure X-axis separation constrains `ux`.
+- **Pair 1 (I2S0, Mic2/Mic3)**: YZ-plane separation constrains `uy + uz`.
+
+Together with the unit-vector constraint `ux² + uy² + uz² = 1`, three
+equations solve three unknowns.  The general solver in `afe_processor.c`
+reads these positions at runtime -- change the coordinates in
+`mic_array_config.h` and the solver adapts automatically.
+
+---
+
+## 🔌 Hardware Wiring
+
+```
+GPIO4  → BCLK  → 4x INMP441 SCK
+GPIO5  → WS    → 4x INMP441 WS (LRCLK)
+GPIO7  → DIN   → Mic0 SD + Mic1 SD       (I2S1)
+GPIO6  → DIN   → Mic2 SD + Mic3 SD       (I2S0)
+
+Mic0 L/R → GND    (left  channel on I2S1)
+Mic1 L/R → 3V3    (right channel on I2S1)
+Mic2 L/R → GND    (left  channel on I2S0)
+Mic3 L/R → 3V3    (right channel on I2S0)
+```
+
+⏱️ **Clock bridging**: I2S0 is configured as Master, generating BCLK and WS.
+I2S1 is configured as Slave, sharing the same BCLK/WS pair.  This ensures
+sample-level synchronization across all four microphones.
+
+---
+
+## 📡 Localization Principle
+
+### 🧠 Core Strategy
+
+Each I2S port carries two microphones sharing a single BCLK domain.
+Cross-correlation within a port is immune to clock drift and propagation-delay
+mismatch between ports.  Two ports provide two independent projection
+constraints on the source direction unit vector **u** = (ux, uy, uz).
+
+### 📊 TDOA Estimation
+
+For each mic pair (a, b) on the same I2S port, the normalized
+cross-correlation function is evaluated over a lag range
+[-max_lag, +max_lag].  The max lag is computed dynamically from the
+pair's physical separation:
+
+```
+max_lag = round(distance / c × fs) + 2
+```
+
+where `c = 343.2 m/s` and `fs = 16000 Hz`.  Quadratic interpolation
+refines the peak to sub-sample resolution.
+
+The resulting delay τ (in samples) gives the path-length difference:
+
+```
+d_ab = -c × τ / fs = (r_b - r_a) · u
+```
+
+### 🧮 Dual-Axis Solver
+
+For pair p with direction vector **r_p** = pos[b] - pos[a] and
+magnitude |**r_p**|, the projection equation is:
+
+```
+d_hat_p · u = delay_to_distance(τ_p) / |r_p|
+```
+
+This yields a 2×2 linear system in (ux, uy) parametrized by uz:
+
+```
+nx0 · ux + ny0 · uy = proj0 - nz0 · uz
+nx1 · ux + ny1 · uy = proj1 - nz1 · uz
+```
+
+Substituting `ux = A + B·uz`, `uy = C + D·uz` into
+`ux² + uy² + uz² = 1` produces a quadratic in uz.  The positive-Z
+root is selected (source is above the microphone plane).
+
+💡 **Noise handling**: when cross-correlation noise pushes the combined
+projection norm beyond the unit sphere (`proj0² + proj1² > 1`), the
+solver scales both projections back to the boundary and retries, yielding
+a best-effort estimate rather than failing silently.
+
+### 🗣️ Voice Activity Detection
+
+A WebRTC VAD instance runs on Mic0 (30 ms frames, mode 0).  Each 32 ms
+I2S capture frame is stored in a 20-frame ring buffer (~80 KB PSRAM).
+
+- 🎯 **Onset**: when VAD detects speech after silence, the solver searches
+  the look-back window (6 frames, ~192 ms) for the frame with the highest
+  RMS energy and runs TDOA on that peak frame.
+- 🔁 **Sustained speech**: TDOA runs every 5th frame (~160 ms) on the
+  current capture frame, giving multiple opportunities per utterance.
+- 🔇 **Silence**: no TDOA, frame counter resets.
+
+### 📈 Confidence
+
+```
+confidence = clamp(0.5 × (corr_pair0 + corr_pair1), 0, 1) × 100
+```
+
+Minimum threshold for output: 1.  (Tunable via `AFE_TDOA_MIN_CONFIDENCE`.)
+
+---
+
+## ⚡ Performance Characteristics
+
+The theoretical angular resolution is determined by the baseline-to-wavelength
+ratio `d / λ`.  At 16 kHz and 343.2 m/s, `λ/2 = 10.7 mm`.
+
+| Baseline | Half-wavelength ratio | Effective resolution |
+|---|---|---|
+| 70 mm (X-axis) | 6.5λ | ~3° at broadside |
+| 42.4 mm (YZ-plane) | 4.0λ | ~5° at broadside |
+
+Larger baselines improve resolution.  The 70 mm X-axis pair provides
+the dominant contribution to azimuth accuracy.
+
+---
+
+## 🛠️ Build
+
+**Prerequisites**: ESP-IDF 5.x with `esp-sr` component installed.
 
 ```bash
+cd walle_ear_s3
 idf.py set-target esp32s3
 idf.py build
 idf.py flash monitor
 ```
 
----
-
-## 使用
-
-USB 连接后，电脑识别为两个设备：
-
-| 设备 | 功能 |
-|------|------|
-| **UAC 麦克风** | 16kHz / 16bit / Mono |
-| **CDC 串口** | 业务数据端口，每秒输出一行 |
-
-串口数据格式（有效声源）：
-
-```
-azi:42,ele:18,conf:76
-```
-
-无有效声源时：
-
-```
-azi:null,ele:null,conf:0
-```
+The `sdkconfig.defaults` enables PSRAM (octal, 80 MHz), TinyUSB CDC,
+ESP-SR VAD model (VADNet1 Medium), I2S ISR IRAM-safe mode, and a 1000 Hz
+FreeRTOS tick for USB audio timing.
 
 ---
 
-## 项目结构
+## 💻 Usage
+
+Connect the ESP32-S3 board via USB.  The computer enumerates two devices:
+
+| Interface | Function |
+|---|---|
+| 🎤 **UAC Microphone** | 16 kHz / 16-bit / Mono (raw Mic0 by default) |
+| 📊 **CDC Serial Port** | Real-time localization telemetry at 1 Hz |
+
+### 📊 CDC Output Format
+
+When a valid source direction is detected:
+
+```
+azi:42,ele:18,conf:76,vad:1
+```
+
+When no valid direction is available:
+
+```
+azi:null,ele:null,conf:0,vad:0
+```
+
+| Field | Meaning | Range |
+|---|---|---|
+| 🧭 `azi` | Azimuth (degrees) | -180° ~ +180° |
+| 📈 `ele` | Elevation (degrees) | -90° ~ +90° |
+| 📊 `conf` | Confidence score | 0 ~ 100 |
+| 🗣️ `vad` | Voice activity (1 = speech, 0 = silence) | 0 or 1 |
+
+### 🐧 Reading CDC on Linux
+
+```bash
+# Find the CDC device (usually /dev/ttyACM0)
+dmesg | grep ttyACM
+
+# Read at 115200 baud
+screen /dev/ttyACM0 115200
+```
+
+### 🎵 Recording UAC Audio
+
+The UAC device appears as a standard USB microphone.  Use any recording
+software or command-line tool:
+
+```bash
+arecord -f S16_LE -r 16000 -c 1 -D plughw:CARD=UAC1Gadget,DEV=0 output.wav
+```
+
+---
+
+## ⚙️ Configuring Microphone Positions
+
+Edit `main/mic_array_config.h` to match your physical layout.  The macros
+are in millimeters.  For example, a compact square layout:
+
+```c
+/* Mic 0 -- origin */
+#define MIC_ARRAY_POS0_MM_X    0.0f
+#define MIC_ARRAY_POS0_MM_Y    0.0f
+#define MIC_ARRAY_POS0_MM_Z    0.0f
+
+/* Mic 1 -- +X direction */
+#define MIC_ARRAY_POS1_MM_X   50.0f
+#define MIC_ARRAY_POS1_MM_Y    0.0f
+#define MIC_ARRAY_POS1_MM_Z    0.0f
+
+/* Mic 2 -- +Y direction */
+#define MIC_ARRAY_POS2_MM_X    0.0f
+#define MIC_ARRAY_POS2_MM_Y   50.0f
+#define MIC_ARRAY_POS2_MM_Z    0.0f
+
+/* Mic 3 -- +Z direction */
+#define MIC_ARRAY_POS3_MM_X    0.0f
+#define MIC_ARRAY_POS3_MM_Y    0.0f
+#define MIC_ARRAY_POS3_MM_Z   50.0f
+```
+
+Then update the pair definitions in `main/afe_processor.c`:
+
+```c
+static const int s_mic_pairs[AFE_NUM_MIC_PAIRS][2] = {
+    {0, 1},    /* X-axis pair, constrains ux */
+    {0, 2},    /* Y-axis pair, constrains uy (or choose {0,3} for uz) */
+};
+```
+
+The general solver auto-adapts to any two non-parallel pair directions.
+
+### ⚠️ Key Constraints
+
+- Each mic pair must share the same I2S port (same BCLK).  Do not mix
+  microphones across I2S0 and I2S1 in a single pair.
+- Pair directions must not be parallel (determinant near zero).  Two
+  roughly orthogonal directions work best.
+- Larger baselines improve angular resolution.  Keep them at least 30 mm
+  for usable TDOA at 16 kHz.
+- Place all microphones in the same plane, or account for Z offsets in
+  the coordinate macros.
+
+---
+
+## 🎛️ Tuning Thresholds
+
+All thresholds are in `main/afe_processor.c` near the top of the file:
+
+```c
+#define AFE_TDOA_MIN_RMS          5.0f    /* frame RMS energy floor          */
+#define AFE_TDOA_MIN_CORRELATION  0.04f   /* cross-correlation minimum       */
+#define AFE_TDOA_MIN_CONFIDENCE   1       /* confidence floor (0..100)       */
+#define AFE_VAD_TDOA_INTERVAL_FRAMES 5    /* TDOA every N frames during speech */
+```
+
+| Parameter | Increase if... | Decrease if... |
+|---|---|---|
+| 🔉 **RMS** | Noisy environment triggers false positives | Whispers are missed |
+| 📊 **Correlation** | Echo/reverberation causes false positives | Distant sources or weak signals are missed |
+| 🎯 **Confidence** | Want more reliable output (fewer hits) | Want more hits (less filtering) |
+| 🔁 **TDOA frequency** | — (lower = fewer updates, less CPU) | Want more frequent updates during speech |
+
+Debug logging is available at the `DEBUG` level.  Each TDOA hit prints:
+
+```
+I (10479) afe_processor: TDOA HIT: azi=-63 ele=24 conf=10 corr=[0.112,0.087] lag=[3.08,-1.33]
+```
+
+Failed attempts print the specific rejection reason (RMS, per-pair
+correlation, solver failure, or confidence).
+
+---
+
+## 📁 Project Structure
 
 ```
 walle_ear_s3/
-├── CMakeLists.txt
-├── sdkconfig.defaults
+├── CMakeLists.txt              # Project declaration
+├── sdkconfig.defaults          # Kconfig defaults (PSRAM, TinyUSB, VAD model)
+├── partitions.csv              # Custom flash partition table (ESP-SR model)
 ├── README.md
-└── main/
-    ├── CMakeLists.txt
-    ├── main.c
-    ├── i2s_mic_driver.c/.h       # I2S 双外设驱动
-    ├── mic_array_config.h        # 麦克风坐标配置
-    ├── afe_processor.c/.h        # 双轴 TDOA 定位 + UAC + CDC
-    ├── usb_composite.c/.h        # TinyUSB UAC+CDC
-    └── tusb_config.h
+├── main/
+│   ├── CMakeLists.txt          # Component build (I2S, ESP-SR, TinyUSB deps)
+│   ├── main.c                  # Entry point
+│   ├── i2s_mic_driver.h        # I2S dual-peripheral driver API
+│   ├── i2s_mic_driver.c        # I2S0 master + I2S1 slave implementation
+│   ├── mic_array_config.h      # Microphone positions and pair count
+│   ├── afe_processor.h         # TDOA + UAC + CDC public API
+│   ├── afe_processor.c         # Dual-axis solver, VAD, ring buffer, USB audio
+│   ├── usb_composite.h         # TinyUSB UAC+CDC composite device API
+│   ├── usb_composite.c         # USB descriptor, UAC streaming, CDC write
+│   └── tusb_config.h           # TinyUSB configuration (UAC + CDC enabled)
 ```
 
 ---
 
-## 配置说明
+## 📦 Dependencies
 
-| 配置文件 | 主要内容 |
-|----------|----------|
-| `main/mic_array_config.h` | 麦克风坐标 (X/Y/Z mm)、声速、mic pair 组合 |
-| `main/i2s_mic_driver.h` | 采样率、位宽、每帧采样数、麦克风数量 |
-| `main/afe_processor.c` | TDOA 门限、歧义阈值 δ、CDC 上报间隔、UAC 音源选择 |
+| Component | Version | Purpose |
+|---|---|---|
+| 🏗️ ESP-IDF | 5.x | Build system and framework |
+| 🧠 ESP-SR | latest | WebRTC VAD (VADNet1 Medium) |
+| 🔌 TinyUSB | via ESP-IDF | USB UAC 1.0 + CDC-ACM composite |
+| 🎛️ esp_driver_i2s | via ESP-IDF | Dual I2S peripheral driver |
+
+---
+
+## 📄 License
+
+MIT License.  See the source files for details.
