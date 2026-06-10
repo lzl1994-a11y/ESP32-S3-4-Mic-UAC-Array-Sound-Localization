@@ -47,6 +47,8 @@
 #define AFE_UAC_RAW_MIC_INDEX 0
 #define AFE_UAC_TEST_TONE_HZ 1000.0f
 #define AFE_UAC_TEST_TONE_AMPLITUDE 8000.0f
+#define AFE_UAC_GAIN_NUM 2    /* 2x digital gain for UAC audio → +6 dB */
+#define AFE_UAC_GAIN_DEN 1
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -652,7 +654,11 @@ static void audio_capture_task(void *arg)
 
 #if AFE_UAC_AUDIO_SOURCE == AFE_UAC_SOURCE_RAW_MIC
         for (size_t i = 0; i < s_feed_samples_per_channel; ++i) {
-            uac_buffer[i] = capture_buffer[i * MIC_COUNT + AFE_UAC_RAW_MIC_INDEX];
+            int32_t sample = (int32_t)capture_buffer[i * MIC_COUNT + AFE_UAC_RAW_MIC_INDEX]
+                             * AFE_UAC_GAIN_NUM / AFE_UAC_GAIN_DEN;
+            if (sample > INT16_MAX) sample = INT16_MAX;
+            if (sample < INT16_MIN) sample = INT16_MIN;
+            uac_buffer[i] = (int16_t)sample;
         }
         write_uac_audio(uac_buffer,
                         s_feed_samples_per_channel * sizeof(int16_t),

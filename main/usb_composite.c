@@ -155,6 +155,38 @@ static void tinyusb_event_callback(tinyusb_event_t *event, void *arg)
     }
 }
 
+#define CDC_CMD_BUF_SIZE 64
+
+static char s_cdc_cmd_buf[CDC_CMD_BUF_SIZE];
+static size_t s_cdc_cmd_len;
+
+static void cdc_rx_callback(int itf, cdcacm_event_t *event)
+{
+    if (event == NULL || event->type != CDC_EVENT_RX) {
+        return;
+    }
+
+    size_t room = CDC_CMD_BUF_SIZE - s_cdc_cmd_len - 1;
+    if (room == 0) {
+        s_cdc_cmd_len = 0; /* overflow, reset */
+    }
+    size_t n = tud_cdc_n_read(itf,
+                              (uint8_t *)&s_cdc_cmd_buf[s_cdc_cmd_len],
+                              (uint32_t)room);
+    s_cdc_cmd_len += n;
+    s_cdc_cmd_buf[s_cdc_cmd_len] = '\0';
+
+    if (strstr(s_cdc_cmd_buf, "getname:WHO_ARE_YOU") != NULL) {
+        tud_cdc_n_write_str(itf, "IAM:ESP_MIC\r\n");
+        tud_cdc_n_write_flush(itf);
+        s_cdc_cmd_len = 0;
+        s_cdc_cmd_buf[0] = '\0';
+    } else if (s_cdc_cmd_len >= CDC_CMD_BUF_SIZE - 1) {
+        s_cdc_cmd_len = 0;
+        s_cdc_cmd_buf[0] = '\0';
+    }
+}
+
 static void cdc_line_state_changed_callback(int itf, cdcacm_event_t *event)
 {
     if (event == NULL || event->type != CDC_EVENT_LINE_STATE_CHANGED) {
@@ -199,7 +231,7 @@ esp_err_t usb_composite_init(void)
 
     const tinyusb_config_cdcacm_t cdc_cfg = {
         .cdc_port = TINYUSB_CDC_ACM_0,
-        .callback_rx = NULL,
+        .callback_rx = cdc_rx_callback,
         .callback_rx_wanted_char = NULL,
         .callback_line_state_changed = cdc_line_state_changed_callback,
         .callback_line_coding_changed = NULL,
