@@ -62,8 +62,8 @@ static const char *TAG = "usb_composite";
 static bool s_initialized;
 static volatile bool s_uac_spk_streaming;
 static volatile bool s_uac_mic_streaming;
-static bool s_mute[CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_TX + 1];
-static int16_t s_volume_db[CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_TX + 1];
+static bool s_mute[CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX + 1];
+static int16_t s_volume_db[CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX + 1];
 static uint32_t s_sample_freq = CFG_TUD_AUDIO_FUNC_1_SAMPLE_RATE;
 static uint8_t s_clock_valid = 1;
 static audio_control_range_4_n_t(1) s_sample_freq_range;
@@ -426,7 +426,7 @@ bool tud_audio_set_req_entity_cb(uint8_t rhport,
         return false;
     }
 
-    if (channel >= (CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_TX + 1)) {
+    if (channel >= (CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX + 1)) {
         return false;
     }
 
@@ -472,12 +472,27 @@ bool tud_audio_get_req_entity_cb(uint8_t rhport, tusb_control_request_t const *r
     uint8_t control = TU_U16_HIGH(request->wValue);
     uint8_t entity = TU_U16_HIGH(request->wIndex);
 
-    if (channel >= (CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_TX + 1)) {
+    if (channel >= (CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX + 1)) {
         return false;
     }
 
     switch (entity) {
     case UAC_ENTITY_INPUT_TERMINAL:
+        if (control == AUDIO_TE_CTRL_CONNECTOR &&
+            request->bRequest == AUDIO_CS_REQ_CUR) {
+            audio_desc_channel_cluster_t cluster = {
+                .bNrChannels = CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_RX,
+                .bmChannelConfig = (audio_channel_config_t)0,
+                .iChannelNames = 0,
+            };
+            return tud_audio_buffer_and_schedule_control_xfer(rhport,
+                                                              request,
+                                                              &cluster,
+                                                              sizeof(cluster));
+        }
+        break;
+
+    case 5: // UAC_ENTITY_MIC_INPUT_TERMINAL
         if (control == AUDIO_TE_CTRL_CONNECTOR &&
             request->bRequest == AUDIO_CS_REQ_CUR) {
             audio_desc_channel_cluster_t cluster = {
