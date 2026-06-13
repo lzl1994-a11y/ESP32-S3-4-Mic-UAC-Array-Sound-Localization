@@ -22,6 +22,9 @@ esp_err_t i2s_mic_driver_start(void);
 esp_err_t i2s_mic_driver_read(int16_t *out_interleaved,
                               size_t samples_per_channel,
                               TickType_t ticks_to_wait);
+
+esp_err_t i2s_mic_driver_write_tx(const int16_t *pcm_stereo, size_t num_samples);
+
 size_t i2s_mic_driver_get_samples_per_channel(void);
 esp_err_t i2s_mic_driver_deinit(void);
 

@@ -11,28 +11,20 @@
 #include "tinyusb_cdc_acm.h"
 #include "tinyusb_default_config.h"
 #include "tusb.h"
+#include "walle_audio_desc.h"
+#include "i2s_mic_driver.h"
 
 #define USB_VID 0xCAFE
 #define USB_PID 0x4031
 #define USB_BCD 0x0100
 
 #define EPNUM_AUDIO_IN 0x81
+#define EPNUM_AUDIO_OUT 0x01
 #define EPNUM_CDC_NOTIF 0x82
 #define EPNUM_CDC_OUT 0x03
 #define EPNUM_CDC_IN 0x83
 #define CDC_NOTIF_EP_SIZE 8
 
-#if defined(TUD_AUDIO20_MIC_ONE_CH_DESCRIPTOR)
-#define WALLE_AUDIO_MIC_DESC_LEN TUD_AUDIO20_MIC_ONE_CH_DESC_LEN
-#define WALLE_AUDIO_MIC_DESCRIPTOR(_itfnum, _stridx, _nbytes, _nbits, _epin, _epsize) \
-    TUD_AUDIO20_MIC_ONE_CH_DESCRIPTOR(_itfnum, _stridx, _nbytes, _nbits, _epin, _epsize)
-#elif defined(TUD_AUDIO_MIC_ONE_CH_DESCRIPTOR)
-#define WALLE_AUDIO_MIC_DESC_LEN TUD_AUDIO_MIC_ONE_CH_DESC_LEN
-#define WALLE_AUDIO_MIC_DESCRIPTOR(_itfnum, _stridx, _nbytes, _nbits, _epin, _epsize) \
-    TUD_AUDIO_MIC_ONE_CH_DESCRIPTOR(_itfnum, _stridx, _nbytes, _nbits, _epin, _epsize)
-#else
-#error "TinyUSB audio microphone descriptor macro not found"
-#endif
 
 // 1. 接口分配：必须把 CDC 提到最前面！（这是修复 Windows 识别的核心）
 enum {
@@ -62,7 +54,7 @@ enum {
 };
 
 #define CONFIG_TOTAL_LEN \
-    (TUD_CONFIG_DESC_LEN + WALLE_AUDIO_MIC_DESC_LEN + TUD_CDC_DESC_LEN)
+    (TUD_CONFIG_DESC_LEN + WALLE_AUDIO_HEADSET_DESC_LEN + TUD_CDC_DESC_LEN)
 
 static const char *TAG = "usb_composite";
 
@@ -105,13 +97,17 @@ static const uint8_t s_configuration_desc[] = {
                        EPNUM_CDC_IN,
                        CFG_TUD_CDC_EP_BUFSIZE),
 
-    // 第二块：再装载 Audio 麦克风描述符
-    WALLE_AUDIO_MIC_DESCRIPTOR(ITF_NUM_AUDIO_CONTROL,
-                               STRID_AUDIO,
-                               CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_TX,
-                               CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_TX * 8,
-                               EPNUM_AUDIO_IN,
-                               CFG_TUD_AUDIO_EP_SZ_IN),
+    // 第二块：再装载 Audio Headset 描述符
+    WALLE_AUDIO_HEADSET_DESCRIPTOR(ITF_NUM_AUDIO_CONTROL,
+                                   STRID_AUDIO,
+                                   CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_TX,
+                                   CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_TX * 8,
+                                   CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX,
+                                   CFG_TUD_AUDIO_FUNC_1_N_BYTES_PER_SAMPLE_RX * 8,
+                                   EPNUM_AUDIO_OUT,
+                                   CFG_TUD_AUDIO_EP_SZ_OUT,
+                                   EPNUM_AUDIO_IN,
+                                   CFG_TUD_AUDIO_EP_SZ_IN),
 };
 
 static const char *s_string_desc[] = {
@@ -152,6 +148,31 @@ static void tinyusb_event_callback(tinyusb_event_t *event, void *arg)
 
     if (event->id == TINYUSB_EVENT_ATTACHED || event->id == TINYUSB_EVENT_DETACHED) {
         s_uac_streaming = false;
+    }
+}
+
+static void audio_spk_task(void *arg)
+{
+    (void)arg;
+    int16_t spk_buf[CFG_TUD_AUDIO_EP_SZ_OUT / 2]; // Max packet size
+
+    while (1) {
+        if (usb_composite_uac_is_streaming()) {
+            uint16_t available = tud_audio_available();
+            if (available > 0) {
+                uint16_t to_read = available > sizeof(spk_buf) ? sizeof(spk_buf) : available;
+                uint16_t bytes_read = tud_audio_read(spk_buf, to_read);
+                if (bytes_read > 0) {
+                    // X3 Pi outputs 16kHz Stereo 16-bit PCM (2 channels)
+                    // The I2S TX expects stereo frames, so num_samples = bytes_read / 4 (2 bytes * 2 channels)
+                    i2s_mic_driver_write_tx(spk_buf, bytes_read / 4);
+                }
+            } else {
+                vTaskDelay(1); // Wait for more data
+            }
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
     }
 }
 
@@ -237,6 +258,9 @@ esp_err_t usb_composite_init(void)
         .callback_line_coding_changed = NULL,
     };
     ESP_RETURN_ON_ERROR(tinyusb_cdcacm_init(&cdc_cfg), TAG, "init CDC ACM failed");
+
+    // Start Audio Speaker Task
+    xTaskCreatePinnedToCore(audio_spk_task, "audio_spk_task", 4096, NULL, 5, NULL, 0);
 
     s_initialized = true;
     ESP_LOGI(TAG, "TinyUSB UAC + CDC composite device initialized");
@@ -354,6 +378,7 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *request)
         s_uac_streaming = alt != 0;
         if (!s_uac_streaming) {
             (void)tud_audio_clear_ep_in_ff();
+            (void)tud_audio_clear_ep_out_ff();
         }
     }
 
@@ -525,6 +550,7 @@ bool tud_audio_set_itf_close_ep_cb(uint8_t rhport, tusb_control_request_t const 
     if (itf == ITF_NUM_AUDIO_STREAMING) {
         s_uac_streaming = false;
         (void)tud_audio_clear_ep_in_ff();
+        (void)tud_audio_clear_ep_out_ff();
     }
 
     return true;

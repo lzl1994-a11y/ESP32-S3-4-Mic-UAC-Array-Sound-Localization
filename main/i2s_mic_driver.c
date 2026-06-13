@@ -17,6 +17,7 @@
 #define I2S_WS_GPIO GPIO_NUM_5
 #define I2S0_DIN_GPIO GPIO_NUM_6
 #define I2S1_DIN_GPIO GPIO_NUM_7
+#define I2S_DOUT_GPIO GPIO_NUM_8
 
 //#define I2S_DMA_DESC_NUM 8
 #define I2S_DMA_DESC_NUM 8
@@ -36,9 +37,11 @@
 static const char *TAG = "i2s_mic";
 
 static i2s_chan_handle_t s_i2s0_rx;
+static i2s_chan_handle_t s_i2s0_tx;
 static i2s_chan_handle_t s_i2s1_rx;
 static int32_t *s_i2s0_raw;
 static int32_t *s_i2s1_raw;
+static int32_t *s_tx_raw_buf;
 static int16_t *s_frame_pool[I2S_FRAME_POOL_BLOCKS];
 static QueueHandle_t s_free_queue;
 static QueueHandle_t s_filled_queue;
@@ -70,7 +73,7 @@ static inline int16_t inmp441_32_to_16(int32_t sample)
     return (int16_t)v;
 }
 
-static i2s_std_config_t make_std_rx_config(gpio_num_t din_gpio)
+static i2s_std_config_t make_std_rx_config(gpio_num_t din_gpio, gpio_num_t dout_gpio)
 {
     i2s_std_config_t config = {
         .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(I2S_MIC_SAMPLE_RATE_HZ),
@@ -80,7 +83,7 @@ static i2s_std_config_t make_std_rx_config(gpio_num_t din_gpio)
             .mclk = I2S_GPIO_UNUSED,
             .bclk = I2S_BCLK_GPIO,
             .ws = I2S_WS_GPIO,
-            .dout = I2S_GPIO_UNUSED,
+            .dout = dout_gpio,
             .din = din_gpio,
             .invert_flags = {
                 .mclk_inv = false,
@@ -97,7 +100,9 @@ static i2s_std_config_t make_std_rx_config(gpio_num_t din_gpio)
 
 static esp_err_t init_i2s_channel(i2s_port_t port,
                                   gpio_num_t din_gpio,
-                                  i2s_chan_handle_t *rx_handle)
+                                  gpio_num_t dout_gpio,
+                                  i2s_chan_handle_t *rx_handle,
+                                  i2s_chan_handle_t *tx_handle)
 {
     // 判断如果是 I2S0 就是 Master，如果是 I2S1 就是 Slave
     i2s_role_t role = (port == I2S_NUM_0) ? I2S_ROLE_MASTER : I2S_ROLE_SLAVE;
@@ -107,16 +112,25 @@ static esp_err_t init_i2s_channel(i2s_port_t port,
     chan_cfg.dma_desc_num = I2S_DMA_DESC_NUM;
     chan_cfg.dma_frame_num = s_samples_per_channel;
 
-    esp_err_t ret = i2s_new_channel(&chan_cfg, NULL, rx_handle);
+    esp_err_t ret = i2s_new_channel(&chan_cfg, tx_handle, rx_handle);
     if (ret != ESP_OK) {
         return ret;
     }
 
-    i2s_std_config_t std_cfg = make_std_rx_config(din_gpio);
-    ret = i2s_channel_init_std_mode(*rx_handle, &std_cfg);
-    if (ret != ESP_OK) {
-        i2s_del_channel(*rx_handle);
-        *rx_handle = NULL;
+    i2s_std_config_t std_cfg = make_std_rx_config(din_gpio, dout_gpio);
+    if (rx_handle && *rx_handle) {
+        ret = i2s_channel_init_std_mode(*rx_handle, &std_cfg);
+        if (ret != ESP_OK) {
+            i2s_del_channel(*rx_handle);
+            *rx_handle = NULL;
+        }
+    }
+    if (tx_handle && *tx_handle) {
+        ret = i2s_channel_init_std_mode(*tx_handle, &std_cfg);
+        if (ret != ESP_OK) {
+            i2s_del_channel(*tx_handle);
+            *tx_handle = NULL;
+        }
     }
     return ret;
 }
@@ -376,10 +390,11 @@ esp_err_t i2s_mic_driver_init(size_t samples_per_channel)
     s_frame_bytes = samples_per_channel * MIC_COUNT * sizeof(int16_t);
 
     s_i2s0_raw = (int32_t *)audio_malloc(s_i2s_read_bytes);
+    s_tx_raw_buf = (int32_t *)audio_malloc(s_i2s_read_bytes);
 #if I2S_USE_SECOND_PORT
     s_i2s1_raw = (int32_t *)audio_malloc(s_i2s_read_bytes);
 #endif
-    if (s_i2s0_raw == NULL
+    if (s_i2s0_raw == NULL || s_tx_raw_buf == NULL
 #if I2S_USE_SECOND_PORT
         || s_i2s1_raw == NULL
 #endif
@@ -409,7 +424,7 @@ esp_err_t i2s_mic_driver_init(size_t samples_per_channel)
 #if I2S_USE_SECOND_PORT
     // 1. 【先】初始化 Slave (I2S1)。
     // 此时底层驱动会把 GPIO 4 和 5 乖乖地配置为“时钟输入”
-    ret = init_i2s_channel(I2S_NUM_1, I2S1_DIN_GPIO, &s_i2s1_rx);
+    ret = init_i2s_channel(I2S_NUM_1, I2S1_DIN_GPIO, I2S_GPIO_UNUSED, &s_i2s1_rx, NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "init I2S1 failed: %s", esp_err_to_name(ret));
         i2s_mic_driver_deinit();
@@ -421,7 +436,7 @@ esp_err_t i2s_mic_driver_init(size_t samples_per_channel)
     // 此时底层驱动会重新接管 GPIO 4 和 5，将其配置为“时钟输出”。
     // 妙就妙在，ESP32 的矩阵路由不会切断刚才 Slave 连好的“输入”线路！
     // 这样一进一出，完美搭桥！
-    ret = init_i2s_channel(I2S_NUM_0, I2S0_DIN_GPIO, &s_i2s0_rx);
+    ret = init_i2s_channel(I2S_NUM_0, I2S0_DIN_GPIO, I2S_DOUT_GPIO, &s_i2s0_rx, &s_i2s0_tx);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "init I2S0 failed: %s", esp_err_to_name(ret));
         i2s_mic_driver_deinit();
@@ -474,6 +489,9 @@ esp_err_t i2s_mic_driver_start(void)
 
     // 然后再开启 Master，时钟一出，两个通道瞬间完美同步对齐！
     ret = i2s_channel_enable(s_i2s0_rx);
+    if (ret == ESP_OK && s_i2s0_tx != NULL) {
+        ret = i2s_channel_enable(s_i2s0_tx);
+    }
     if (ret != ESP_OK) {
 #if I2S_USE_SECOND_PORT
         (void)i2s_channel_disable(s_i2s1_rx);
@@ -485,6 +503,7 @@ esp_err_t i2s_mic_driver_start(void)
     ret = flush_startup_frames();
     if (ret != ESP_OK) {
         (void)i2s_channel_disable(s_i2s0_rx);
+        if (s_i2s0_tx) (void)i2s_channel_disable(s_i2s0_tx);
 #if I2S_USE_SECOND_PORT
         (void)i2s_channel_disable(s_i2s1_rx);
 #endif
@@ -503,6 +522,7 @@ esp_err_t i2s_mic_driver_start(void)
     if (ok != pdPASS) {
         s_started = false;
         (void)i2s_channel_disable(s_i2s0_rx);
+        if (s_i2s0_tx) (void)i2s_channel_disable(s_i2s0_tx);
 #if I2S_USE_SECOND_PORT
         (void)i2s_channel_disable(s_i2s1_rx);
 #endif
@@ -553,6 +573,11 @@ esp_err_t i2s_mic_driver_deinit(void)
         (void)i2s_del_channel(s_i2s0_rx);
         s_i2s0_rx = NULL;
     }
+    if (s_i2s0_tx != NULL) {
+        (void)i2s_channel_disable(s_i2s0_tx);
+        (void)i2s_del_channel(s_i2s0_tx);
+        s_i2s0_tx = NULL;
+    }
     if (s_i2s1_rx != NULL) {
         (void)i2s_channel_disable(s_i2s1_rx);
         (void)i2s_del_channel(s_i2s1_rx);
@@ -569,8 +594,10 @@ esp_err_t i2s_mic_driver_deinit(void)
     }
 
     free(s_i2s0_raw);
+    free(s_tx_raw_buf);
     free(s_i2s1_raw);
     s_i2s0_raw = NULL;
+    s_tx_raw_buf = NULL;
     s_i2s1_raw = NULL;
 
     for (size_t i = 0; i < I2S_FRAME_POOL_BLOCKS; ++i) {
@@ -584,4 +611,27 @@ esp_err_t i2s_mic_driver_deinit(void)
     s_captured_frames = 0;
     s_initialized = false;
     return ESP_OK;
+}
+
+esp_err_t i2s_mic_driver_write_tx(const int16_t *pcm_stereo, size_t num_samples)
+{
+    if (!s_started || s_i2s0_tx == NULL) {
+        return ESP_ERR_INVALID_STATE;
+    }
+    if (pcm_stereo == NULL || num_samples == 0) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (num_samples > s_samples_per_channel) {
+        num_samples = s_samples_per_channel;
+    }
+
+    // Convert 16-bit PCM to 32-bit for I2S (shift left by 16)
+    for (size_t i = 0; i < num_samples * 2; ++i) {
+        s_tx_raw_buf[i] = ((int32_t)pcm_stereo[i]) << 16;
+    }
+
+    size_t bytes_written = 0;
+    esp_err_t ret = i2s_channel_write(s_i2s0_tx, s_tx_raw_buf, num_samples * 2 * sizeof(int32_t), &bytes_written, portMAX_DELAY);
+    return ret;
 }
