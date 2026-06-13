@@ -31,7 +31,8 @@ enum {
     ITF_NUM_CDC = 0,            // 串口控制排第 0 号
     ITF_NUM_CDC_DATA,           // 串口数据排第 1 号
     ITF_NUM_AUDIO_CONTROL,      // 音频控制退到第 2 号
-    ITF_NUM_AUDIO_STREAMING,    // 音频数据退到第 3 号
+    ITF_NUM_AUDIO_STREAMING_SPK,// 扬声器音频数据排第 3 号
+    ITF_NUM_AUDIO_STREAMING_MIC,// 麦克风音频数据排第 4 号
     ITF_NUM_TOTAL,
 };
 
@@ -59,7 +60,8 @@ enum {
 static const char *TAG = "usb_composite";
 
 static bool s_initialized;
-static volatile bool s_uac_streaming;
+static volatile bool s_uac_spk_streaming;
+static volatile bool s_uac_mic_streaming;
 static bool s_mute[CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_TX + 1];
 static int16_t s_volume_db[CFG_TUD_AUDIO_FUNC_1_N_CHANNELS_TX + 1];
 static uint32_t s_sample_freq = CFG_TUD_AUDIO_FUNC_1_SAMPLE_RATE;
@@ -147,7 +149,8 @@ static void tinyusb_event_callback(tinyusb_event_t *event, void *arg)
     }
 
     if (event->id == TINYUSB_EVENT_ATTACHED || event->id == TINYUSB_EVENT_DETACHED) {
-        s_uac_streaming = false;
+        s_uac_spk_streaming = false;
+        s_uac_mic_streaming = false;
     }
 }
 
@@ -157,7 +160,7 @@ static void audio_spk_task(void *arg)
     int16_t spk_buf[CFG_TUD_AUDIO_EP_SZ_OUT / 2]; // Max packet size
 
     while (1) {
-        if (usb_composite_uac_is_streaming()) {
+        if (tud_mounted() && tud_audio_mounted() && s_uac_spk_streaming) {
             uint16_t available = tud_audio_available();
             if (available > 0) {
                 uint16_t to_read = available > sizeof(spk_buf) ? sizeof(spk_buf) : available;
@@ -274,7 +277,7 @@ bool usb_composite_is_mounted(void)
 
 bool usb_composite_uac_is_streaming(void)
 {
-    return tud_mounted() && tud_audio_mounted() && s_uac_streaming;
+    return tud_mounted() && tud_audio_mounted() && s_uac_mic_streaming;
 }
 
 bool usb_composite_cdc_is_connected(void)
@@ -374,11 +377,15 @@ bool tud_audio_set_itf_cb(uint8_t rhport, tusb_control_request_t const *request)
     uint8_t itf = TU_U16_LOW(request->wIndex);
     uint8_t alt = TU_U16_LOW(request->wValue);
 
-    if (itf == ITF_NUM_AUDIO_STREAMING) {
-        s_uac_streaming = alt != 0;
-        if (!s_uac_streaming) {
-            (void)tud_audio_clear_ep_in_ff();
+    if (itf == ITF_NUM_AUDIO_STREAMING_SPK) {
+        s_uac_spk_streaming = alt != 0;
+        if (!s_uac_spk_streaming) {
             (void)tud_audio_clear_ep_out_ff();
+        }
+    } else if (itf == ITF_NUM_AUDIO_STREAMING_MIC) {
+        s_uac_mic_streaming = alt != 0;
+        if (!s_uac_mic_streaming) {
+            (void)tud_audio_clear_ep_in_ff();
         }
     }
 
@@ -547,10 +554,12 @@ bool tud_audio_set_itf_close_ep_cb(uint8_t rhport, tusb_control_request_t const 
     (void)rhport;
 
     uint8_t itf = TU_U16_LOW(request->wIndex);
-    if (itf == ITF_NUM_AUDIO_STREAMING) {
-        s_uac_streaming = false;
-        (void)tud_audio_clear_ep_in_ff();
+    if (itf == ITF_NUM_AUDIO_STREAMING_SPK) {
+        s_uac_spk_streaming = false;
         (void)tud_audio_clear_ep_out_ff();
+    } else if (itf == ITF_NUM_AUDIO_STREAMING_MIC) {
+        s_uac_mic_streaming = false;
+        (void)tud_audio_clear_ep_in_ff();
     }
 
     return true;
