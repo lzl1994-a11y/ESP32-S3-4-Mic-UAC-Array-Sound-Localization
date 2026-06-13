@@ -168,7 +168,7 @@ static void audio_spk_task(void *arg)
                 if (bytes_read > 0) {
                     static int play_count = 0;
                     if (++play_count % 500 == 0) {
-                        ESP_LOGI(TAG, "Speaker receiving data from PC... bytes: %d", bytes_read);
+                        ESP_LOGI(TAG, "Speaker receiving data from PC... bytes: %d, sample: %d", bytes_read, spk_buf[0]);
                     }
                     // X3 Pi outputs 16kHz Stereo 16-bit PCM (2 channels)
                     // The I2S TX expects stereo frames, so num_samples = bytes_read / 4 (2 bytes * 2 channels)
