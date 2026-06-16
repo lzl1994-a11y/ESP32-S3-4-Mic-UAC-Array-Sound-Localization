@@ -54,6 +54,7 @@ static size_t s_frame_bytes;
 static uint32_t s_captured_frames;
 static bool s_initialized;
 static volatile bool s_started;
+static volatile bool s_tx_enabled;
 
 static void *audio_malloc(size_t size)
 {
@@ -481,11 +482,11 @@ esp_err_t i2s_mic_driver_start(void)
     esp_err_t ret = ESP_OK;
 #endif
 
-    // 然后再开启 Master，时钟一出，两个通道瞬间完美同步对齐！
+    // 然后再开启 Master RX，时钟一出，两个通道瞬间完美同步对齐！
+    // ⚠️ TX 不在此处启用——延迟到 i2s_mic_driver_write_tx() 首次写入时才启用，
+    // 避免 USB Host 连接前 TX DMA 长时间欠载导致不可恢复停滞（根因：噪音无音乐）。
     ret = i2s_channel_enable(s_i2s0_rx);
-    if (ret == ESP_OK && s_i2s0_tx != NULL) {
-        ret = i2s_channel_enable(s_i2s0_tx);
-    }
+    s_tx_enabled = false;
     if (ret != ESP_OK) {
 #if I2S_USE_SECOND_PORT
         (void)i2s_channel_disable(s_i2s1_rx);
@@ -568,7 +569,10 @@ esp_err_t i2s_mic_driver_deinit(void)
         s_i2s0_rx = NULL;
     }
     if (s_i2s0_tx != NULL) {
-        (void)i2s_channel_disable(s_i2s0_tx);
+        if (s_tx_enabled) {
+            (void)i2s_channel_disable(s_i2s0_tx);
+            s_tx_enabled = false;
+        }
         (void)i2s_del_channel(s_i2s0_tx);
         s_i2s0_tx = NULL;
     }
@@ -616,13 +620,26 @@ esp_err_t i2s_mic_driver_write_tx(const int16_t *pcm_stereo, size_t num_samples)
         return ESP_ERR_INVALID_ARG;
     }
 
+    // Lazy-enable TX on first write: prevents DMA underflow during the gap between
+    // i2s_mic_driver_start() and USB host connecting + starting audio streaming.
+    // Extended underflow on ESP32-S3 I2S TX can cause unrecoverable DMA stall.
+    if (!s_tx_enabled) {
+        esp_err_t en_ret = i2s_channel_enable(s_i2s0_tx);
+        if (en_ret != ESP_OK) {
+            ESP_LOGE(TAG, "TX lazy-enable failed: %s", esp_err_to_name(en_ret));
+            return en_ret;
+        }
+        s_tx_enabled = true;
+        ESP_LOGI(TAG, "I2S TX lazy-enabled on first write (%u samples)", (unsigned)num_samples);
+    }
+
     if (num_samples > s_samples_per_channel) {
         num_samples = s_samples_per_channel;
     }
 
     // Convert 16-bit PCM to 32-bit I2S slot: apply 4x gain, shift left 16 bits.
     // PCM5102 is 24-bit DAC; 16-bit data in high 16 bits of 32-bit slot is correct:
-    //   0x7FFF << 16 = 0x7FFF0000, top 24 bits = 0x7FFF00, ~50% of full scale 0x7FFFFF
+    //   0x7FFF << 16 = 0x7FFF0000, top 24 bits = 0x7FFF00, ~100% of full scale 0x7FFFFF
     for (size_t i = 0; i < num_samples * 2; ++i) {
         int32_t sample = (int32_t)pcm_stereo[i] * I2S_SPK_GAIN;
         if (sample > INT16_MAX) sample = INT16_MAX;
@@ -630,7 +647,33 @@ esp_err_t i2s_mic_driver_write_tx(const int16_t *pcm_stereo, size_t num_samples)
         s_tx_raw_buf[i] = sample << 16;
     }
 
+    // Debug: log first write details to confirm data actually reaches I2S peripheral
+    static int tx_write_count = 0;
+    if (tx_write_count < 3) {
+        ESP_LOGI(TAG, "TX write #%d: num_samples=%u, pcm[0]=%d pcm[1]=%d pcm[2]=%d pcm[3]=%d",
+                 tx_write_count + 1,
+                 (unsigned)num_samples,
+                 (int)pcm_stereo[0], (int)pcm_stereo[1],
+                 (int)pcm_stereo[2], (int)pcm_stereo[3]);
+        ESP_LOGI(TAG, "TX write #%d: raw[0]=0x%08lx raw[1]=0x%08lx raw[2]=0x%08lx raw[3]=0x%08lx",
+                 tx_write_count + 1,
+                 (unsigned long)s_tx_raw_buf[0], (unsigned long)s_tx_raw_buf[1],
+                 (unsigned long)s_tx_raw_buf[2], (unsigned long)s_tx_raw_buf[3]);
+    }
+
     size_t bytes_written = 0;
-    esp_err_t ret = i2s_channel_write(s_i2s0_tx, s_tx_raw_buf, num_samples * 2 * sizeof(int32_t), &bytes_written, portMAX_DELAY);
+    esp_err_t ret = i2s_channel_write(s_i2s0_tx, s_tx_raw_buf,
+                                      num_samples * 2 * sizeof(int32_t),
+                                      &bytes_written, portMAX_DELAY);
+
+    if (tx_write_count < 3) {
+        ESP_LOGI(TAG, "TX write #%d: i2s_channel_write ret=%s bytes_written=%u expected=%u",
+                 tx_write_count + 1,
+                 esp_err_to_name(ret),
+                 (unsigned)bytes_written,
+                 (unsigned)(num_samples * 2 * sizeof(int32_t)));
+        tx_write_count++;
+    }
+
     return ret;
 }
