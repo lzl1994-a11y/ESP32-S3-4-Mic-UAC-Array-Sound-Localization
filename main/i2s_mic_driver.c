@@ -18,6 +18,7 @@
 #define I2S0_DIN_GPIO GPIO_NUM_6
 #define I2S1_DIN_GPIO GPIO_NUM_7
 #define I2S_DOUT_GPIO GPIO_NUM_8
+#define I2S_MCLK_GPIO GPIO_NUM_9     // PCM5102 SCK (pin13) MCLK input
 
 //#define I2S_DMA_DESC_NUM 8
 #define I2S_DMA_DESC_NUM 8
@@ -81,7 +82,7 @@ static i2s_std_config_t make_std_rx_config(gpio_num_t din_gpio, gpio_num_t dout_
         .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(I2S_DATA_BIT_WIDTH_32BIT,
                                                         I2S_SLOT_MODE_STEREO),
         .gpio_cfg = {
-            .mclk = I2S_GPIO_UNUSED,
+            .mclk = I2S_MCLK_GPIO,
             .bclk = I2S_BCLK_GPIO,
             .ws = I2S_WS_GPIO,
             .dout = dout_gpio,
@@ -94,6 +95,7 @@ static i2s_std_config_t make_std_rx_config(gpio_num_t din_gpio, gpio_num_t dout_
         },
     };
 
+    config.clk_cfg.mclk_multiple = I2S_MCLK_MULTIPLE_256;  // 256fs = 4.096MHz @ 16kHz
     config.slot_cfg.slot_bit_width = I2S_SLOT_BIT_WIDTH_32BIT;
     config.slot_cfg.slot_mask = I2S_STD_SLOT_BOTH;
     return config;
@@ -618,13 +620,14 @@ esp_err_t i2s_mic_driver_write_tx(const int16_t *pcm_stereo, size_t num_samples)
         num_samples = s_samples_per_channel;
     }
 
-    // Convert 16-bit PCM to 32-bit for I2S: apply 4x gain, then shift left 8 bits
-    // to fill the 24-bit PCM5102 DAC range (original <<16 only filled 1/256 of range)
+    // Convert 16-bit PCM to 32-bit I2S slot: apply 4x gain, shift left 16 bits.
+    // PCM5102 is 24-bit DAC; 16-bit data in high 16 bits of 32-bit slot is correct:
+    //   0x7FFF << 16 = 0x7FFF0000, top 24 bits = 0x7FFF00, ~50% of full scale 0x7FFFFF
     for (size_t i = 0; i < num_samples * 2; ++i) {
         int32_t sample = (int32_t)pcm_stereo[i] * I2S_SPK_GAIN;
         if (sample > INT16_MAX) sample = INT16_MAX;
         if (sample < INT16_MIN) sample = INT16_MIN;
-        s_tx_raw_buf[i] = sample << 8;
+        s_tx_raw_buf[i] = sample << 16;
     }
 
     size_t bytes_written = 0;
