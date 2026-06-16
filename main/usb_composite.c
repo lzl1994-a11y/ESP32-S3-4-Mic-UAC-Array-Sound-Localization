@@ -162,8 +162,17 @@ static void audio_spk_task(void *arg)
     while (1) {
         if (tud_mounted() && tud_audio_mounted() && s_uac_spk_streaming) {
             uint16_t available = tud_audio_available();
-            if (available > 0) {
-                uint16_t to_read = available > sizeof(spk_buf) ? sizeof(spk_buf) : available;
+            
+            // 关键修复：必须保证每次读取的字节数是 4 的整数倍（16-bit 立体声 = 4 bytes）
+            // 否则如果有残留字节，会导致下一次读取时左右声道错位，发出极其刺耳的杂音！
+            uint16_t to_read = available - (available % 4);
+            uint16_t max_read = sizeof(spk_buf) - (sizeof(spk_buf) % 4);
+            
+            if (to_read > max_read) {
+                to_read = max_read;
+            }
+
+            if (to_read > 0) {
                 uint16_t bytes_read = tud_audio_read(spk_buf, to_read);
                 if (bytes_read > 0) {
                     static int play_count = 0;

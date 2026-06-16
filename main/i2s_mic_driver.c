@@ -145,20 +145,11 @@ static void recycle_frame(int16_t *frame)
 static void bridge_i2s_shared_clock(void)
 {
 #if I2S_USE_SECOND_PORT
-    gpio_set_direction(I2S_BCLK_GPIO, GPIO_MODE_INPUT_OUTPUT);
-    gpio_set_direction(I2S_WS_GPIO, GPIO_MODE_INPUT_OUTPUT);
-
-    esp_rom_gpio_connect_out_signal(I2S_BCLK_GPIO,
-                                    i2s_periph_signal[I2S_NUM_0].m_rx_bck_sig,
-                                    false,
-                                    false);
+    // 不要调用 gpio_set_direction，也不要映射 out_signal，否则会摧毁原有时钟输出！
+    // 只需要把物理引脚上的信号“偷接”给 I2S1 RX 的输入端即可
     esp_rom_gpio_connect_in_signal(I2S_BCLK_GPIO,
                                    i2s_periph_signal[I2S_NUM_1].s_rx_bck_sig,
                                    false);
-    esp_rom_gpio_connect_out_signal(I2S_WS_GPIO,
-                                    i2s_periph_signal[I2S_NUM_0].m_rx_ws_sig,
-                                    false,
-                                    false);
     esp_rom_gpio_connect_in_signal(I2S_WS_GPIO,
                                    i2s_periph_signal[I2S_NUM_1].s_rx_ws_sig,
                                    false);
