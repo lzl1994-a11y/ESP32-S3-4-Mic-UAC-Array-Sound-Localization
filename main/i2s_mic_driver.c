@@ -17,8 +17,9 @@
 #define I2S_WS_GPIO GPIO_NUM_5
 #define I2S0_DIN_GPIO GPIO_NUM_6
 #define I2S1_DIN_GPIO GPIO_NUM_7
-#define I2S_DOUT_GPIO GPIO_NUM_8
-#define I2S_MCLK_GPIO GPIO_NUM_9     // PCM5102 SCK (pin13) MCLK input
+#define I2S_DOUT_GPIO GPIO_NUM_8       // (unused — I2S0 TX removed, now I2S1 TX on GPIO 10)
+#define I2S1_DOUT_GPIO GPIO_NUM_10    // I2S1 TX DOUT → PCM5102 DIN (pin14)
+#define I2S_MCLK_GPIO GPIO_NUM_9      // PCM5102 SCK (pin13) MCLK input
 
 //#define I2S_DMA_DESC_NUM 8
 #define I2S_DMA_DESC_NUM 8
@@ -39,8 +40,8 @@
 static const char *TAG = "i2s_mic";
 
 static i2s_chan_handle_t s_i2s0_rx;
-static i2s_chan_handle_t s_i2s0_tx;
 static i2s_chan_handle_t s_i2s1_rx;
+static i2s_chan_handle_t s_i2s1_tx;   // I2S1 TX → PCM5102 (I2S0 TX removed)
 static int32_t *s_i2s0_raw;
 static int32_t *s_i2s1_raw;
 static int32_t *s_tx_raw_buf;
@@ -156,6 +157,13 @@ static void bridge_i2s_shared_clock(void)
                                    false);
     esp_rom_gpio_connect_in_signal(I2S_WS_GPIO,
                                    i2s_periph_signal[I2S_NUM_1].s_rx_ws_sig,
+                                   false);
+    // I2S1 TX (PCM5102 output) needs the shared BCK/WS from I2S0 master
+    esp_rom_gpio_connect_in_signal(I2S_BCLK_GPIO,
+                                   i2s_periph_signal[I2S_NUM_1].s_tx_bck_sig,
+                                   false);
+    esp_rom_gpio_connect_in_signal(I2S_WS_GPIO,
+                                   i2s_periph_signal[I2S_NUM_1].s_tx_ws_sig,
                                    false);
 #endif
 }
@@ -417,9 +425,9 @@ esp_err_t i2s_mic_driver_init(size_t samples_per_channel)
 
     esp_err_t ret = ESP_OK;
 #if I2S_USE_SECOND_PORT
-    // 1. 【先】初始化 Slave (I2S1)。
+    // 1. I2S1 Slave: RX (INMP441 Mic0/Mic1) + TX (PCM5102 DAC).
     // 此时底层驱动会把 GPIO 4 和 5 乖乖地配置为“时钟输入”
-    ret = init_i2s_channel(I2S_NUM_1, I2S1_DIN_GPIO, I2S_GPIO_UNUSED, &s_i2s1_rx, NULL);
+    ret = init_i2s_channel(I2S_NUM_1, I2S1_DIN_GPIO, I2S1_DOUT_GPIO, &s_i2s1_rx, &s_i2s1_tx);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "init I2S1 failed: %s", esp_err_to_name(ret));
         i2s_mic_driver_deinit();
@@ -427,11 +435,11 @@ esp_err_t i2s_mic_driver_init(size_t samples_per_channel)
     }
 #endif
 
-    // 2. 【后】初始化 Master (I2S0)。
+    // 2. I2S0 Master: RX only (INMP441 Mic2/Mic3). TX moved to I2S1.
     // 此时底层驱动会重新接管 GPIO 4 和 5，将其配置为“时钟输出”。
     // 妙就妙在，ESP32 的矩阵路由不会切断刚才 Slave 连好的“输入”线路！
     // 这样一进一出，完美搭桥！
-    ret = init_i2s_channel(I2S_NUM_0, I2S0_DIN_GPIO, I2S_DOUT_GPIO, &s_i2s0_rx, &s_i2s0_tx);
+    ret = init_i2s_channel(I2S_NUM_0, I2S0_DIN_GPIO, I2S_GPIO_UNUSED, &s_i2s0_rx, NULL);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "init I2S0 failed: %s", esp_err_to_name(ret));
         i2s_mic_driver_deinit();
@@ -450,11 +458,12 @@ esp_err_t i2s_mic_driver_init(size_t samples_per_channel)
              (unsigned)s_samples_per_channel,
              (unsigned)s_frame_bytes);
 #if I2S_USE_SECOND_PORT
-    ESP_LOGI(TAG, "I2S0+I2S1 mode: BCLK=%d WS=%d DIN0=%d DIN1=%d",
+    ESP_LOGI(TAG, "I2S0+I2S1 mode: BCLK=%d WS=%d DIN0(GPIO%d)=Mic2/3 DIN1(GPIO%d)=Mic0/1 DOUT1(GPIO%d)=PCM5102",
              I2S_BCLK_GPIO,
              I2S_WS_GPIO,
              I2S0_DIN_GPIO,
-             I2S1_DIN_GPIO);
+             I2S1_DIN_GPIO,
+             I2S1_DOUT_GPIO);
 #else
     ESP_LOGI(TAG, "I2S0 stereo test mode: BCLK=%d WS=%d DIN=%d, I2S1 disabled",
              I2S_BCLK_GPIO,
@@ -498,7 +507,6 @@ esp_err_t i2s_mic_driver_start(void)
     ret = flush_startup_frames();
     if (ret != ESP_OK) {
         (void)i2s_channel_disable(s_i2s0_rx);
-        if (s_i2s0_tx) (void)i2s_channel_disable(s_i2s0_tx);
 #if I2S_USE_SECOND_PORT
         (void)i2s_channel_disable(s_i2s1_rx);
 #endif
@@ -517,7 +525,6 @@ esp_err_t i2s_mic_driver_start(void)
     if (ok != pdPASS) {
         s_started = false;
         (void)i2s_channel_disable(s_i2s0_rx);
-        if (s_i2s0_tx) (void)i2s_channel_disable(s_i2s0_tx);
 #if I2S_USE_SECOND_PORT
         (void)i2s_channel_disable(s_i2s1_rx);
 #endif
@@ -568,18 +575,18 @@ esp_err_t i2s_mic_driver_deinit(void)
         (void)i2s_del_channel(s_i2s0_rx);
         s_i2s0_rx = NULL;
     }
-    if (s_i2s0_tx != NULL) {
-        if (s_tx_enabled) {
-            (void)i2s_channel_disable(s_i2s0_tx);
-            s_tx_enabled = false;
-        }
-        (void)i2s_del_channel(s_i2s0_tx);
-        s_i2s0_tx = NULL;
-    }
     if (s_i2s1_rx != NULL) {
         (void)i2s_channel_disable(s_i2s1_rx);
         (void)i2s_del_channel(s_i2s1_rx);
         s_i2s1_rx = NULL;
+    }
+    if (s_i2s1_tx != NULL) {
+        if (s_tx_enabled) {
+            (void)i2s_channel_disable(s_i2s1_tx);
+            s_tx_enabled = false;
+        }
+        (void)i2s_del_channel(s_i2s1_tx);
+        s_i2s1_tx = NULL;
     }
 
     if (s_free_queue != NULL) {
@@ -613,7 +620,7 @@ esp_err_t i2s_mic_driver_deinit(void)
 
 esp_err_t i2s_mic_driver_write_tx(const int16_t *pcm_stereo, size_t num_samples)
 {
-    if (!s_started || s_i2s0_tx == NULL) {
+    if (!s_started || s_i2s1_tx == NULL) {
         return ESP_ERR_INVALID_STATE;
     }
     if (pcm_stereo == NULL || num_samples == 0) {
@@ -624,7 +631,7 @@ esp_err_t i2s_mic_driver_write_tx(const int16_t *pcm_stereo, size_t num_samples)
     // i2s_mic_driver_start() and USB host connecting + starting audio streaming.
     // Extended underflow on ESP32-S3 I2S TX can cause unrecoverable DMA stall.
     if (!s_tx_enabled) {
-        esp_err_t en_ret = i2s_channel_enable(s_i2s0_tx);
+        esp_err_t en_ret = i2s_channel_enable(s_i2s1_tx);
         if (en_ret != ESP_OK) {
             ESP_LOGE(TAG, "TX lazy-enable failed: %s", esp_err_to_name(en_ret));
             return en_ret;
@@ -662,7 +669,7 @@ esp_err_t i2s_mic_driver_write_tx(const int16_t *pcm_stereo, size_t num_samples)
     }
 
     size_t bytes_written = 0;
-    esp_err_t ret = i2s_channel_write(s_i2s0_tx, s_tx_raw_buf,
+    esp_err_t ret = i2s_channel_write(s_i2s1_tx, s_tx_raw_buf,
                                       num_samples * 2 * sizeof(int32_t),
                                       &bytes_written, portMAX_DELAY);
 
