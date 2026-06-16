@@ -33,6 +33,7 @@
 #define I2S_CAPTURE_LOG_FRAMES 4
 #define I2S_USE_SECOND_PORT (MIC_COUNT > 2)
 #define INMP441_32_TO_16_SHIFT 16
+#define I2S_SPK_GAIN 4             // 4x digital gain for speaker output (PCM5102)
 
 static const char *TAG = "i2s_mic";
 
@@ -617,9 +618,13 @@ esp_err_t i2s_mic_driver_write_tx(const int16_t *pcm_stereo, size_t num_samples)
         num_samples = s_samples_per_channel;
     }
 
-    // Convert 16-bit PCM to 32-bit for I2S (shift left by 16)
+    // Convert 16-bit PCM to 32-bit for I2S: apply 4x gain, then shift left 8 bits
+    // to fill the 24-bit PCM5102 DAC range (original <<16 only filled 1/256 of range)
     for (size_t i = 0; i < num_samples * 2; ++i) {
-        s_tx_raw_buf[i] = ((int32_t)pcm_stereo[i]) << 16;
+        int32_t sample = (int32_t)pcm_stereo[i] * I2S_SPK_GAIN;
+        if (sample > INT16_MAX) sample = INT16_MAX;
+        if (sample < INT16_MIN) sample = INT16_MIN;
+        s_tx_raw_buf[i] = sample << 8;
     }
 
     size_t bytes_written = 0;
