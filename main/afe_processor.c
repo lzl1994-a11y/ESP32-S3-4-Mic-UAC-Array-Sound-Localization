@@ -468,7 +468,7 @@ static bool solve_dual_axis(const float delays[AFE_NUM_MIC_PAIRS],
 
 static void update_source_position(const int16_t *interleaved_frame)
 {
-    if (interleaved_frame == NULL || s_feed_samples_per_channel == 0) {
+    if (interleaved_frame == NULL || s_algo_samples_per_channel == 0) {
         publish_invalid_position();
         return;
     }
@@ -662,7 +662,7 @@ static void audio_capture_task(void *arg)
                 /* Periodic TDOA during sustained speech */
                 ++s_speech_frame_count;
                 if (s_speech_frame_count % AFE_VAD_TDOA_INTERVAL_FRAMES == 0) {
-                    update_source_position(capture_buffer);
+                    update_source_position(algo_buffer);
                 }
             }
         } else {
@@ -674,7 +674,7 @@ static void audio_capture_task(void *arg)
         }
 
 #if AFE_UAC_AUDIO_SOURCE == AFE_UAC_SOURCE_RAW_MIC
-        for (size_t i = 0; i < s_feed_samples_per_channel; ++i) {
+        for (size_t i = 0; i < s_capture_samples_per_channel; ++i) {
             int32_t sample = (int32_t)capture_buffer[i * MIC_COUNT + AFE_UAC_RAW_MIC_INDEX]
                              * AFE_UAC_GAIN_NUM / AFE_UAC_GAIN_DEN;
             if (sample > INT16_MAX) sample = INT16_MAX;
@@ -682,12 +682,12 @@ static void audio_capture_task(void *arg)
             uac_buffer[i] = (int16_t)sample;
         }
         write_uac_audio(uac_buffer,
-                        s_feed_samples_per_channel * sizeof(int16_t),
+                        s_capture_samples_per_channel * sizeof(int16_t),
                         "raw_mic");
 #elif AFE_UAC_AUDIO_SOURCE == AFE_UAC_SOURCE_TEST_TONE
-        fill_test_tone(uac_buffer, s_feed_samples_per_channel);
+        fill_test_tone(uac_buffer, s_capture_samples_per_channel);
         write_uac_audio(uac_buffer,
-                        s_feed_samples_per_channel * sizeof(int16_t),
+                        s_capture_samples_per_channel * sizeof(int16_t),
                         "test_tone");
 #endif
     }
