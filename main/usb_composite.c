@@ -15,7 +15,7 @@
 #include "i2s_mic_driver.h"
 
 #define USB_VID 0xCAFE
-#define USB_PID 0x4031
+#define USB_PID 0x4033
 #define USB_BCD 0x0100
 
 #define EPNUM_AUDIO_IN 0x81
