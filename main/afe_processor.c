@@ -29,7 +29,9 @@
 #define AFE_VAD_RING_FRAMES 20
 #define AFE_VAD_LOOKBACK_FRAMES 6
 #define AFE_VAD_FRAME_MS 30
-#define AFE_VAD_FRAME_SAMPLES ((I2S_MIC_SAMPLE_RATE_HZ * AFE_VAD_FRAME_MS) / 1000)
+#define AFE_ALGO_SAMPLE_RATE_HZ 16000
+#define AFE_VAD_FRAME_SAMPLES ((AFE_ALGO_SAMPLE_RATE_HZ * AFE_VAD_FRAME_MS) / 1000)
+#define AFE_CAPTURE_FRAME_SAMPLES ((I2S_MIC_SAMPLE_RATE_HZ * AFE_VAD_FRAME_MS) / 1000)
 #define AFE_VAD_TDOA_INTERVAL_FRAMES 5   /* TDOA every 5th frame during speech */
 #define AFE_UNIT_VECTOR_SCALE 1000.0f
 #define AFE_UAC_WRITE_MARGIN_MS 80
@@ -81,7 +83,8 @@ static const int s_mic_pairs[AFE_NUM_MIC_PAIRS][2] = {
 
 static TaskHandle_t s_audio_task;
 static TaskHandle_t s_cdc_task;
-static size_t s_feed_samples_per_channel;
+static size_t s_algo_samples_per_channel;
+static size_t s_capture_samples_per_channel;
 static portMUX_TYPE s_position_lock = portMUX_INITIALIZER_UNLOCKED;
 static afe_source_position_t s_latest_position = {
     .valid = false,
@@ -185,7 +188,7 @@ static int find_peak_ring_frame(int window_frames)
 
     for (int f = 0; f < search_frames; ++f) {
         const int idx = (s_ring_write_idx - 1 - f + AFE_VAD_RING_FRAMES) % AFE_VAD_RING_FRAMES;
-        const size_t total = s_feed_samples_per_channel * MIC_COUNT;
+        const size_t total = s_algo_samples_per_channel * MIC_COUNT;
         uint64_t sum_sq = 0;
         for (size_t i = 0; i < total; ++i) {
             int32_t s = s_ring_buffer[idx][i];
@@ -206,7 +209,7 @@ static void ring_buffer_push(const int16_t *frame)
         s_ring_write_idx = 0;
     }
     memcpy(s_ring_buffer[s_ring_write_idx], frame,
-           s_feed_samples_per_channel * MIC_COUNT * sizeof(int16_t));
+           s_algo_samples_per_channel * MIC_COUNT * sizeof(int16_t));
     s_ring_write_idx = (s_ring_write_idx + 1) % AFE_VAD_RING_FRAMES;
     if (s_ring_count < AFE_VAD_RING_FRAMES) {
         ++s_ring_count;
@@ -225,7 +228,7 @@ static int max_tdoa_lag_samples(void)
         }
     }
 
-    int lag = (int)((max_distance * I2S_MIC_SAMPLE_RATE_HZ / AFE_SPEED_OF_SOUND_MPS) + 2.0f);
+    int lag = (int)((max_distance * AFE_ALGO_SAMPLE_RATE_HZ / AFE_SPEED_OF_SOUND_MPS) + 2.0f);
     if (lag < 1) {
         lag = 1;
     }
@@ -238,16 +241,16 @@ static int max_tdoa_lag_samples(void)
 static float channel_mean(const int16_t *interleaved_frame, int mic)
 {
     int64_t sum = 0;
-    for (size_t i = 0; i < s_feed_samples_per_channel; ++i) {
+    for (size_t i = 0; i < s_algo_samples_per_channel; ++i) {
         sum += interleaved_frame[i * MIC_COUNT + mic];
     }
-    return (float)sum / (float)s_feed_samples_per_channel;
+    return (float)sum / (float)s_algo_samples_per_channel;
 }
 
 static float frame_rms(const int16_t *interleaved_frame)
 {
     uint64_t sum_sq = 0;
-    const size_t total_samples = s_feed_samples_per_channel * MIC_COUNT;
+    const size_t total_samples = s_algo_samples_per_channel * MIC_COUNT;
     for (size_t i = 0; i < total_samples; ++i) {
         int32_t sample = interleaved_frame[i];
         sum_sq += (uint64_t)(sample * sample);
@@ -263,11 +266,11 @@ static float normalized_correlation_at_lag(const int16_t *interleaved_frame,
                                            float mean_b)
 {
     const int abs_lag = lag >= 0 ? lag : -lag;
-    if ((size_t)abs_lag >= s_feed_samples_per_channel) {
+    if ((size_t)abs_lag >= s_algo_samples_per_channel) {
         return 0.0f;
     }
 
-    const size_t count = s_feed_samples_per_channel - (size_t)abs_lag;
+    const size_t count = s_algo_samples_per_channel - (size_t)abs_lag;
     float sum_ab = 0.0f;
     float sum_aa = 0.0f;
     float sum_bb = 0.0f;
@@ -343,7 +346,7 @@ static bool estimate_pair_delay_samples(const int16_t *interleaved_frame,
 
 static float delay_to_distance(float delay_samples)
 {
-    return -AFE_SPEED_OF_SOUND_MPS * delay_samples / (float)I2S_MIC_SAMPLE_RATE_HZ;
+    return -AFE_SPEED_OF_SOUND_MPS * delay_samples / (float)AFE_ALGO_SAMPLE_RATE_HZ;
 }
 
 /*
@@ -579,7 +582,7 @@ static void audio_capture_task(void *arg)
 {
     (void)arg;
 
-    const size_t capture_samples = s_feed_samples_per_channel * MIC_COUNT;
+    const size_t capture_samples = s_capture_samples_per_channel * MIC_COUNT;
     int16_t *capture_buffer = (int16_t *)audio_calloc(capture_samples, sizeof(int16_t));
     if (capture_buffer == NULL) {
         ESP_LOGE(TAG, "capture buffer alloc failed");
@@ -587,7 +590,16 @@ static void audio_capture_task(void *arg)
         return;
     }
 
-    int16_t *uac_buffer = (int16_t *)audio_calloc(s_feed_samples_per_channel, sizeof(int16_t));
+    const size_t algo_samples = s_algo_samples_per_channel * MIC_COUNT;
+    int16_t *algo_buffer = (int16_t *)audio_calloc(algo_samples, sizeof(int16_t));
+    if (algo_buffer == NULL) {
+        ESP_LOGE(TAG, "algo buffer alloc failed");
+        free(capture_buffer);
+        vTaskDelete(NULL);
+        return;
+    }
+
+    int16_t *uac_buffer = (int16_t *)audio_calloc(s_capture_samples_per_channel, sizeof(int16_t));
     if (uac_buffer == NULL) {
         ESP_LOGE(TAG, "UAC buffer alloc failed");
         free(capture_buffer);
@@ -600,6 +612,7 @@ static void audio_capture_task(void *arg)
     if (vad_buf == NULL) {
         ESP_LOGE(TAG, "VAD buffer alloc failed");
         free(uac_buffer);
+        free(algo_buffer);
         free(capture_buffer);
         vTaskDelete(NULL);
         return;
@@ -607,7 +620,7 @@ static void audio_capture_task(void *arg)
 
     while (true) {
         esp_err_t ret = i2s_mic_driver_read(capture_buffer,
-                                            s_feed_samples_per_channel,
+                                            s_capture_samples_per_channel,
                                             portMAX_DELAY);
         if (ret != ESP_OK) {
             ESP_LOGW(TAG, "read mic frame failed: %s", esp_err_to_name(ret));
@@ -615,16 +628,24 @@ static void audio_capture_task(void *arg)
             continue;
         }
 
-        /* Store full 4ch frame in ring buffer */
-        ring_buffer_push(capture_buffer);
+        /* 3:1 Decimation */
+        const int decimation_factor = I2S_MIC_SAMPLE_RATE_HZ / AFE_ALGO_SAMPLE_RATE_HZ;
+        for (size_t i = 0; i < s_algo_samples_per_channel; ++i) {
+            for (size_t ch = 0; ch < MIC_COUNT; ++ch) {
+                algo_buffer[i * MIC_COUNT + ch] = capture_buffer[(i * decimation_factor) * MIC_COUNT + ch];
+            }
+        }
+
+        /* Store full 4ch downsampled frame in ring buffer */
+        ring_buffer_push(algo_buffer);
 
         /* Extract Mic0 first N samples for VAD (30ms = 480 samples) */
         for (int i = 0; i < AFE_VAD_FRAME_SAMPLES; ++i) {
-            vad_buf[i] = capture_buffer[i * MIC_COUNT + 0];
+            vad_buf[i] = algo_buffer[i * MIC_COUNT + 0];
         }
         vad_state_t vad_state = vad_process(s_vad_handle,
                                             vad_buf,
-                                            I2S_MIC_SAMPLE_RATE_HZ,
+                                            AFE_ALGO_SAMPLE_RATE_HZ,
                                             AFE_VAD_FRAME_MS);
 
         if (vad_state == VAD_SPEECH) {
@@ -728,11 +749,12 @@ esp_err_t afe_processor_init(void)
         return ESP_ERR_INVALID_STATE;
     }
 
-    s_feed_samples_per_channel = AUDIO_FRAME_SAMPLES;
+    s_capture_samples_per_channel = AUDIO_FRAME_SAMPLES;
+    s_algo_samples_per_channel = AUDIO_FRAME_SAMPLES / (I2S_MIC_SAMPLE_RATE_HZ / AFE_ALGO_SAMPLE_RATE_HZ);
     publish_invalid_position();
 
     /* Allocate ring buffer for VAD lookback */
-    const size_t frame_bytes = s_feed_samples_per_channel * MIC_COUNT * sizeof(int16_t);
+    const size_t frame_bytes = s_algo_samples_per_channel * MIC_COUNT * sizeof(int16_t);
     s_ring_buffer = (int16_t **)audio_calloc(AFE_VAD_RING_FRAMES, sizeof(int16_t *));
     if (s_ring_buffer == NULL) {
         ESP_LOGE(TAG, "ring buffer ptr alloc failed");
@@ -768,8 +790,8 @@ esp_err_t afe_processor_init(void)
              (unsigned)((AFE_VAD_RING_FRAMES * frame_bytes) / 1024),
              AFE_VAD_FRAME_MS);
     ESP_LOGI(TAG,
-             "Raw UAC/TDOA pipeline ready: frame=%u samples/ch, capture_channels=%d",
-             (unsigned)s_feed_samples_per_channel,
+             "Raw UAC pipeline ready: frame=%u samples/ch, capture_channels=%d",
+             (unsigned)s_capture_samples_per_channel,
              MIC_COUNT);
     ESP_LOGI(TAG,
              "Mic positions mm: m0=(%d,%d,%d) m1=(%d,%d,%d) m2=(%d,%d,%d) m3=(%d,%d,%d)",
@@ -832,7 +854,7 @@ esp_err_t afe_processor_start(void)
 
 size_t afe_processor_get_feed_samples_per_channel(void)
 {
-    return s_feed_samples_per_channel;
+    return s_capture_samples_per_channel;
 }
 
 int afe_processor_get_doa_angle(void)
