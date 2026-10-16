@@ -21,7 +21,7 @@
 #define AUDIO_TASK_STACK 8192
 #define AUDIO_TASK_PRIORITY 9
 #define AUDIO_TASK_CORE 1
-#define AFE_SPEED_OF_SOUND_MPS 343.2f
+#define AFE_SPEED_OF_SOUND_MPS (SOUND_SPEED_MM_PER_S * 1e-3f)
 #define AFE_TDOA_MIN_RMS 5.0f
 #define AFE_TDOA_MIN_CORRELATION 0.04f
 #define AFE_TDOA_MIN_CONFIDENCE 1
@@ -31,7 +31,6 @@
 #define AFE_VAD_FRAME_MS 30
 #define AFE_ALGO_SAMPLE_RATE_HZ 16000
 #define AFE_VAD_FRAME_SAMPLES ((AFE_ALGO_SAMPLE_RATE_HZ * AFE_VAD_FRAME_MS) / 1000)
-#define AFE_CAPTURE_FRAME_SAMPLES ((I2S_MIC_SAMPLE_RATE_HZ * AFE_VAD_FRAME_MS) / 1000)
 #define AFE_VAD_TDOA_INTERVAL_FRAMES 5   /* TDOA every 5th frame during speech */
 #define AFE_UNIT_VECTOR_SCALE 1000.0f
 #define AFE_UAC_WRITE_MARGIN_MS 80
@@ -62,24 +61,12 @@
 
 static const char *TAG = "afe_processor";
 
-typedef struct {
-    float x;
-    float y;
-    float z;
-} mic_position_t;
-
-static const mic_position_t s_mic_positions[MIC_COUNT] = {
-    {MIC_ARRAY_POS0_MM_X, MIC_ARRAY_POS0_MM_Y, MIC_ARRAY_POS0_MM_Z},
-    {MIC_ARRAY_POS1_MM_X, MIC_ARRAY_POS1_MM_Y, MIC_ARRAY_POS1_MM_Z},
-    {MIC_ARRAY_POS2_MM_X, MIC_ARRAY_POS2_MM_Y, MIC_ARRAY_POS2_MM_Z},
-    {MIC_ARRAY_POS3_MM_X, MIC_ARRAY_POS3_MM_Y, MIC_ARRAY_POS3_MM_Z},
-};
-
-#define AFE_NUM_MIC_PAIRS 2
-static const int s_mic_pairs[AFE_NUM_MIC_PAIRS][2] = {
-    {0, 1},    /* Mic0→Mic1  (I2S1), direction (70, 0, 0) mm  → constrains ux     */
-    {2, 3},    /* Mic2→Mic3  (I2S0), direction (0, 30, 30) mm → constrains uy+uz  */
-};
+_Static_assert(MIC_COUNT == 2, "Azimuth processing requires exactly two microphones");
+_Static_assert(I2S_MIC_SAMPLE_RATE_HZ % AFE_ALGO_SAMPLE_RATE_HZ == 0,
+               "Capture rate must be an integer multiple of the algorithm rate");
+_Static_assert(SAMPLES_PER_CHANNEL * AFE_ALGO_SAMPLE_RATE_HZ ==
+               AFE_VAD_FRAME_SAMPLES * I2S_MIC_SAMPLE_RATE_HZ,
+               "Each capture frame must cover one complete VAD frame");
 
 static TaskHandle_t s_audio_task;
 static TaskHandle_t s_cdc_task;
@@ -123,36 +110,6 @@ static float clampf(float value, float min_value, float max_value)
 static int float_to_int_round(float value)
 {
     return (int)(value >= 0.0f ? value + 0.5f : value - 0.5f);
-}
-
-static mic_position_t vec_sub(mic_position_t a, mic_position_t b)
-{
-    return (mic_position_t) {
-        .x = a.x - b.x,
-        .y = a.y - b.y,
-        .z = a.z - b.z,
-    };
-}
-
-static float vec_norm(mic_position_t v)
-{
-    return sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
-}
-
-static float direction_azimuth_deg(float ux, float uy)
-{
-    float azimuth = atan2f(ux, uy) * (180.0f / (float)M_PI);
-    if (azimuth > 180.0f) {
-        azimuth -= 360.0f;
-    } else if (azimuth <= -180.0f) {
-        azimuth += 360.0f;
-    }
-    return azimuth;
-}
-
-static float direction_elevation_deg(float ux, float uy, float uz)
-{
-    return atan2f(uz, sqrtf(ux * ux + uy * uy)) * (180.0f / (float)M_PI);
 }
 
 static void publish_source_position(afe_source_position_t position)
@@ -218,17 +175,8 @@ static void ring_buffer_push(const int16_t *frame)
 
 static int max_tdoa_lag_samples(void)
 {
-    float max_distance = 0.0f;
-    for (int p = 0; p < AFE_NUM_MIC_PAIRS; ++p) {
-        const int a = s_mic_pairs[p][0];
-        const int b = s_mic_pairs[p][1];
-        const float distance_m = vec_norm(vec_sub(s_mic_positions[b], s_mic_positions[a])) * 1e-3f; /* mm→m */
-        if (distance_m > max_distance) {
-            max_distance = distance_m;
-        }
-    }
-
-    int lag = (int)((max_distance * AFE_ALGO_SAMPLE_RATE_HZ / AFE_SPEED_OF_SOUND_MPS) + 2.0f);
+    const float distance_m = MIC_ARRAY_SPACING_MM * 1e-3f;
+    int lag = (int)ceilf(distance_m * AFE_ALGO_SAMPLE_RATE_HZ / AFE_SPEED_OF_SOUND_MPS) + 1;
     if (lag < 1) {
         lag = 1;
     }
@@ -349,120 +297,26 @@ static float delay_to_distance(float delay_samples)
     return -AFE_SPEED_OF_SOUND_MPS * delay_samples / (float)AFE_ALGO_SAMPLE_RATE_HZ;
 }
 
-/*
- * General dual-axis TDOA solver.
- *
- * For each mic pair p with direction vector rₚ = pos[b] − pos[a]:
- *   d̂ₚ·u = delay_to_distance(τₚ) / |rₚ|
- *
- * Together with |u| = 1, solve for the source unit vector u = (ux, uy, uz).
- * No hardcoded layout assumptions — auto-adapts to s_mic_positions.
- *
- * With the current layout (Pair 0: X-axis 70mm, Pair 1: YZ-plane 42.4mm),
- * this gives two independent constraints:
- *   ux = delay_to_distance(τ₀) / 0.070
- *   0.707·uy + 0.707·uz = delay_to_distance(τ₁) / 0.0424
+/* Assume a horizontal source and select uy >= 0 (the front semicircle).
+ * Positive lag means Mic1 arrives later than Mic0, so the source is to the left.
+ * Keep Cartesian +X pointing right, but report left-positive azimuth.
  */
-static bool solve_dual_axis(const float delays[AFE_NUM_MIC_PAIRS],
-                            const float corrs[AFE_NUM_MIC_PAIRS],
-                            float *out_ux, float *out_uy, float *out_uz,
-                            float *out_confidence)
+static bool solve_front_azimuth(float delay_samples, float *out_ux,
+                                float *out_uy, float *out_azimuth)
 {
-    /* Compute normalized direction vectors from actual mic positions */
-    float nx[AFE_NUM_MIC_PAIRS], ny[AFE_NUM_MIC_PAIRS], nz[AFE_NUM_MIC_PAIRS];
-    float proj[AFE_NUM_MIC_PAIRS];
-
-    for (int p = 0; p < AFE_NUM_MIC_PAIRS; ++p) {
-        const int a = s_mic_pairs[p][0];
-        const int b = s_mic_pairs[p][1];
-        const float dx = (s_mic_positions[b].x - s_mic_positions[a].x) * 1e-3f; /* mm→m */
-        const float dy = (s_mic_positions[b].y - s_mic_positions[a].y) * 1e-3f;
-        const float dz = (s_mic_positions[b].z - s_mic_positions[a].z) * 1e-3f;
-        const float mag = sqrtf(dx * dx + dy * dy + dz * dz);
-
-        if (mag < 1e-6f) return false;
-        nx[p] = dx / mag;
-        ny[p] = dy / mag;
-        nz[p] = dz / mag;
-        proj[p] = delay_to_distance(delays[p]) / mag;
+    const float spacing_m = MIC_ARRAY_SPACING_MM * 1e-3f;
+    if (!isfinite(spacing_m) || spacing_m <= 0.0f || !isfinite(delay_samples)) {
+        return false;
     }
-
-    /*
-     * Solve 2×2 linear system for (ux, uy) in terms of uz:
-     *   nx₀·ux + ny₀·uy = proj₀ − nz₀·uz
-     *   nx₁·ux + ny₁·uy = proj₁ − nz₁·uz
-     */
-    const float det = nx[0] * ny[1] - nx[1] * ny[0];
-    if (fabsf(det) < 1e-4f) return false;
-
-    /* ux = A + B·uz,  uy = C + D·uz */
-    const float A = (proj[0] * ny[1] - proj[1] * ny[0]) / det;
-    const float B = (nz[1] * ny[0] - nz[0] * ny[1]) / det;
-    const float C = (nx[0] * proj[1] - nx[1] * proj[0]) / det;
-    const float D = (nx[1] * nz[0] - nx[0] * nz[1]) / det;
-
-    /* Quadratic: (B² + D² + 1)·uz² + 2(AB + CD)·uz + (A² + C² − 1) = 0 */
-    const float qa = B * B + D * D + 1.0f;
-    const float qb = 2.0f * (A * B + C * D);
-    const float qc = A * A + C * C - 1.0f;
-
-    const float disc = qb * qb - 4.0f * qa * qc;
-    if (disc < 0.0f) {
-        /*
-         * Noisy delay estimates can push the combined projection norm
-         * beyond the unit sphere (proj₀² + proj₁² > 1).  Scale both
-         * projections back to the boundary and recompute.
-         */
-        const float proj_norm_sq = proj[0] * proj[0] + proj[1] * proj[1];
-        if (proj_norm_sq <= 1.0f) {
-            return false;
-        }
-        const float scale = 1.0f / sqrtf(proj_norm_sq);
-        const float p0 = proj[0] * scale;
-        const float p1 = proj[1] * scale;
-
-        const float A2 = (p0 * ny[1] - p1 * ny[0]) / det;
-        const float C2 = (nx[0] * p1 - nx[1] * p0) / det;
-        const float qa2 = B * B + D * D + 1.0f;
-        const float qb2 = 2.0f * (A2 * B + C2 * D);
-        const float qc2 = A2 * A2 + C2 * C2 - 1.0f;
-        const float disc2 = qb2 * qb2 - 4.0f * qa2 * qc2;
-        if (disc2 < 0.0f) return false;
-
-        const float sqrt_disc2 = sqrtf(disc2);
-        const float uz1b = (-qb2 + sqrt_disc2) / (2.0f * qa2);
-        const float uz2b = (-qb2 - sqrt_disc2) / (2.0f * qa2);
-        const float uzb = (uz1b >= uz2b) ? uz1b : uz2b;
-        const float uxb = A2 + B * uzb;
-        const float uyb = C2 + D * uzb;
-
-        const float normb = sqrtf(uxb * uxb + uyb * uyb + uzb * uzb);
-        if (normb < 0.01f) return false;
-
-        *out_ux = uxb / normb;
-        *out_uy = uyb / normb;
-        *out_uz = uzb / normb;
-        *out_confidence = clampf(0.5f * (corrs[0] + corrs[1]), 0.0f, 1.0f) * 100.0f;
-        return true;
+    const float max_delay = spacing_m * AFE_ALGO_SAMPLE_RATE_HZ / AFE_SPEED_OF_SOUND_MPS;
+    /* Allow half a sample of estimation error at endfire, reject impossible peaks. */
+    if (fabsf(delay_samples) > max_delay + 0.5f) {
+        return false;
     }
-
-    const float sqrt_disc = sqrtf(disc);
-    const float uz1 = (-qb + sqrt_disc) / (2.0f * qa);
-    const float uz2 = (-qb - sqrt_disc) / (2.0f * qa);
-
-    /* Pick positive-z root (source is above mic plane) */
-    const float uz = (uz1 >= uz2) ? uz1 : uz2;
-    const float ux = A + B * uz;
-    const float uy = C + D * uz;
-
-    /* Renormalize to unit length (compensates floating-point drift) */
-    const float norm = sqrtf(ux * ux + uy * uy + uz * uz);
-    if (norm < 0.01f) return false;
-
-    *out_ux = ux / norm;
-    *out_uy = uy / norm;
-    *out_uz = uz / norm;
-    *out_confidence = clampf(0.5f * (corrs[0] + corrs[1]), 0.0f, 1.0f) * 100.0f;
+    const float ux = clampf(delay_to_distance(delay_samples) / spacing_m, -1.0f, 1.0f);
+    *out_ux = ux;
+    *out_uy = sqrtf(fmaxf(0.0f, 1.0f - ux * ux));
+    *out_azimuth = -asinf(ux) * (180.0f / (float)M_PI);
     return true;
 }
 
@@ -485,32 +339,18 @@ static void update_source_position(const int16_t *interleaved_frame)
         means[mic] = channel_mean(interleaved_frame, mic);
     }
 
-    float delays[AFE_NUM_MIC_PAIRS] = {0};
-    float corrs[AFE_NUM_MIC_PAIRS] = {0};
-
-    for (int p = 0; p < AFE_NUM_MIC_PAIRS; ++p) {
-        const int a = s_mic_pairs[p][0];
-        const int b = s_mic_pairs[p][1];
-        if (!estimate_pair_delay_samples(interleaved_frame, a, b, means,
-                                         &delays[p], &corrs[p])) {
-            ESP_LOGD(TAG, "TDOA skip: pair%d corr=%.3f < %.3f",
-                     p, (double)corrs[p], (double)AFE_TDOA_MIN_CORRELATION);
-            publish_invalid_position();
-            return;
-        }
-    }
-
-    ESP_LOGD(TAG, "TDOA: pair0 corr=%.3f lag=%.2f  pair1 corr=%.3f lag=%.2f  rms=%.1f",
-             (double)corrs[0], (double)delays[0],
-             (double)corrs[1], (double)delays[1],
-             (double)rms);
-
-    float ux, uy, uz, confidence;
-    if (!solve_dual_axis(delays, corrs, &ux, &uy, &uz, &confidence)) {
-        ESP_LOGD(TAG, "TDOA skip: solve_dual_axis failed");
+    float delay, corr;
+    if (!estimate_pair_delay_samples(interleaved_frame, 0, 1, means, &delay, &corr)) {
         publish_invalid_position();
         return;
     }
+
+    float ux, uy, azimuth;
+    if (!solve_front_azimuth(delay, &ux, &uy, &azimuth)) {
+        publish_invalid_position();
+        return;
+    }
+    const float confidence = clampf(corr, 0.0f, 1.0f) * 100.0f;
 
     if (confidence < (float)AFE_TDOA_MIN_CONFIDENCE) {
         ESP_LOGD(TAG, "TDOA skip: conf=%.1f < %d",
@@ -519,22 +359,17 @@ static void update_source_position(const int16_t *interleaved_frame)
         return;
     }
 
-    const float azimuth = direction_azimuth_deg(ux, uy);
-    const float elevation = direction_elevation_deg(ux, uy, uz);
-
     afe_source_position_t position = {
         .valid = true,
         .x_milli = float_to_int_round(ux * AFE_UNIT_VECTOR_SCALE),
         .y_milli = float_to_int_round(uy * AFE_UNIT_VECTOR_SCALE),
-        .z_milli = float_to_int_round(uz * AFE_UNIT_VECTOR_SCALE),
+        .z_milli = 0,
         .azimuth_deg = float_to_int_round(azimuth),
-        .elevation_deg = float_to_int_round(elevation),
+        .elevation_deg = 0,
         .confidence = float_to_int_round(confidence),
     };
-    ESP_LOGI(TAG, "TDOA HIT: azi=%d ele=%d conf=%d corr=[%.3f,%.3f] lag=[%.2f,%.2f]",
-             position.azimuth_deg, position.elevation_deg, position.confidence,
-             (double)corrs[0], (double)corrs[1],
-             (double)delays[0], (double)delays[1]);
+    ESP_LOGI(TAG, "TDOA HIT: azi=%d conf=%d corr=%.3f lag=%.2f",
+             position.azimuth_deg, position.confidence, (double)corr, (double)delay);
     publish_source_position(position);
 }
 
@@ -602,12 +437,13 @@ static void audio_capture_task(void *arg)
     int16_t *uac_buffer = (int16_t *)audio_calloc(s_capture_samples_per_channel, sizeof(int16_t));
     if (uac_buffer == NULL) {
         ESP_LOGE(TAG, "UAC buffer alloc failed");
+        free(algo_buffer);
         free(capture_buffer);
         vTaskDelete(NULL);
         return;
     }
 
-    /* VAD sub-frame buffer: extract Mic0 first 480 samples per 512-sample frame */
+    /* One continuous 30 ms Mic0 frame for VAD. */
     int16_t *vad_buf = (int16_t *)audio_calloc(AFE_VAD_FRAME_SAMPLES, sizeof(int16_t));
     if (vad_buf == NULL) {
         ESP_LOGE(TAG, "VAD buffer alloc failed");
@@ -636,10 +472,10 @@ static void audio_capture_task(void *arg)
             }
         }
 
-        /* Store full 4ch downsampled frame in ring buffer */
+        /* Store the stereo downsampled frame in the ring buffer. */
         ring_buffer_push(algo_buffer);
 
-        /* Extract Mic0 first N samples for VAD (30ms = 480 samples) */
+        /* Extract Mic0 for VAD (30 ms = 480 samples). */
         for (int i = 0; i < AFE_VAD_FRAME_SAMPLES; ++i) {
             vad_buf[i] = algo_buffer[i * MIC_COUNT + 0];
         }
@@ -749,6 +585,12 @@ esp_err_t afe_processor_init(void)
         return ESP_ERR_INVALID_STATE;
     }
 
+    if (!isfinite(MIC_ARRAY_SPACING_MM) || MIC_ARRAY_SPACING_MM <= 0.0f ||
+        MIC_ARRAY_SPACING_MM * 1e-3f * AFE_ALGO_SAMPLE_RATE_HZ / AFE_SPEED_OF_SOUND_MPS >
+            AFE_TDOA_MAX_LAG_SAMPLES - 1) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
     s_capture_samples_per_channel = AUDIO_FRAME_SAMPLES;
     s_algo_samples_per_channel = AUDIO_FRAME_SAMPLES / (I2S_MIC_SAMPLE_RATE_HZ / AFE_ALGO_SAMPLE_RATE_HZ);
     publish_invalid_position();
@@ -772,7 +614,7 @@ esp_err_t afe_processor_init(void)
 
     /* Create WebRTC VAD: mode 0 (most sensitive), 16kHz, 30ms frame */
     s_vad_handle = vad_create_with_param(VAD_MODE_0,
-                                         I2S_MIC_SAMPLE_RATE_HZ,
+                                         AFE_ALGO_SAMPLE_RATE_HZ,
                                          AFE_VAD_FRAME_MS,
                                          128,   /* min speech ms */
                                          500);  /* min noise ms */
@@ -793,20 +635,8 @@ esp_err_t afe_processor_init(void)
              "Raw UAC pipeline ready: frame=%u samples/ch, capture_channels=%d",
              (unsigned)s_capture_samples_per_channel,
              MIC_COUNT);
-    ESP_LOGI(TAG,
-             "Mic positions mm: m0=(%d,%d,%d) m1=(%d,%d,%d) m2=(%d,%d,%d) m3=(%d,%d,%d)",
-             float_to_int_round(MIC_ARRAY_POS0_MM_X),
-             float_to_int_round(MIC_ARRAY_POS0_MM_Y),
-             float_to_int_round(MIC_ARRAY_POS0_MM_Z),
-             float_to_int_round(MIC_ARRAY_POS1_MM_X),
-             float_to_int_round(MIC_ARRAY_POS1_MM_Y),
-             float_to_int_round(MIC_ARRAY_POS1_MM_Z),
-             float_to_int_round(MIC_ARRAY_POS2_MM_X),
-             float_to_int_round(MIC_ARRAY_POS2_MM_Y),
-             float_to_int_round(MIC_ARRAY_POS2_MM_Z),
-             float_to_int_round(MIC_ARRAY_POS3_MM_X),
-             float_to_int_round(MIC_ARRAY_POS3_MM_Y),
-             float_to_int_round(MIC_ARRAY_POS3_MM_Z));
+    ESP_LOGI(TAG, "Horizontal pair: spacing=%.1f mm, azimuth left +90 / front 0 / right -90",
+             (double)MIC_ARRAY_SPACING_MM);
 #if AFE_UAC_AUDIO_SOURCE == AFE_UAC_SOURCE_RAW_MIC
     ESP_LOGI(TAG, "UAC audio source: raw mic%d, no AFE/NS/AGC/VAD", AFE_UAC_RAW_MIC_INDEX + 1);
 #elif AFE_UAC_AUDIO_SOURCE == AFE_UAC_SOURCE_TEST_TONE

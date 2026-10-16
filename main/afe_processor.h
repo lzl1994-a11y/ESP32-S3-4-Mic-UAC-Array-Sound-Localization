@@ -17,11 +17,11 @@ int afe_processor_get_doa_angle(void);
 
 typedef struct {
     bool valid;
-    int x_milli;        // Far-field unit vector x * 1000
-    int y_milli;        // Far-field unit vector y * 1000
-    int z_milli;        // Far-field unit vector z * 1000, positive side of mic plane
-    int azimuth_deg;    // -180..180, -1 when invalid
-    int elevation_deg;  // -90..90, -1 when invalid
+    int x_milli;        // Horizontal unit vector x * 1000, +X right
+    int y_milli;        // Horizontal unit vector y * 1000, +Y forward (>= 0)
+    int z_milli;        // Always 0: elevation is not measured
+    int azimuth_deg;    // -90..90, left positive; check valid before using
+    int elevation_deg;  // 0 when valid (not measured), -1 when invalid
     int confidence;     // 0..100
     uint32_t sequence;
 } afe_source_position_t;

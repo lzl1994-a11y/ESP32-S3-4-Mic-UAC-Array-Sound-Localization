@@ -1,117 +1,84 @@
-# Ear S3 (4-Mic 3D Sound Source Localization)
+# Ear S3 — Single-I2S Two-Microphone Azimuth
 
-[![English](#-english-version)](#-english-version) [![中文](#-中文版)](#-中文版)
+This branch captures two INMP441 microphones through I2S1 and estimates horizontal
+sound direction in the front semicircle. Forward is 0°, left is +90°, right is -90°.
+USB provides a 48 kHz mono microphone, a 48 kHz stereo speaker, and CDC coordinates.
 
-A 4-microphone 3D sound source localization implementation solution based on ESP32-S3.
-Supports Native USB Composite Device (Driver-free UAC audio streaming + CDC serial coordinate output).
+## 单 I2S 双麦克风版本
 
----
+分支：`codex/single-i2s`。
 
-## 🇺🇸 English Version
+- 只初始化 I2S1：TX 先初始化为 Master，RX 使用同一外设的全双工共享时钟。
+- TX 启动前预填静音，启动后持续提供时钟；播放缓冲耗尽时自动清零，避免重复旧音频。
+- Mic0、Mic1 组成水平麦克风对，默认间距 70 mm。
+- 采集为 48 kHz、双通道、16-bit PCM，每通道每帧 1440 点（30 ms）。
+- 保留现有 3:1 抽取，得到两路 16 kHz 音频，用于 VAD 和 TDOA。
+- Mic0 检测到人声后，通过两路互相关和峰值插值估计时间差。
+- 只选择前半圆方向：正前方 0°，向左 0°～+90°，向右 0°～-90°。
+- 不再计算仰角；为兼容现有串口格式，有效结果的 `ele` 固定为 0。
+- USB 麦克风仍输出 Mic0 单声道音频（48 kHz，2 倍数字增益）。
+- USB 双声道播放继续通过 I2S1 TX 输出到 PCM5102（4 倍数字增益并限幅）。
 
-This project provides a pragmatic approach to 3D sound source tracking for interactive devices.
+两颗麦克风必须水平放置；算法按声源处于水平面、远场的假设估计角度。
+双麦克风无法区分前后，也无法测量高度或距离。后方声源会映射到对应的
+前半圆角度，“只保留前面”表示选择前方解，不表示能够排除后方声音。
+当前降采样仍为直接抽取，尚未增加抗混叠低通滤波。
 
-### Architecture & Design Choices
+## 接线
 
-#### 1. VAD Trigger (WebRTC VAD)
-Instead of running continuous, heavy TDOA matrix calculations or neural network VADs (like ESP-SR's VADN), this module uses the standard WebRTC VAD.
-*   **Why**: TDOA calculation on a 4-mic array is CPU-intensive. The WebRTC VAD acts as a lightweight trigger. The TDOA algorithm only runs when actual speech is detected, freeing up the ESP32-S3's dual-core CPU for other tasks like UI rendering.
+以设备朝向为准：Mic0 放左侧，Mic1 放右侧。两颗麦克风共用 SD 数据线，
+通过各自的 L/R 选择引脚分别占用左右时隙。
 
-#### 2. Dual-Cone Intersection Geometry
-We abandoned traditional 4-channel synchronized beamforming and instead use a decoupled Dual-Cone Intersection geometric algorithm.
-*   **The Pitfall We Avoided**: The ESP32-S3 requires two separate I2S peripherals (I2S0 and I2S1) to capture 4 channels. We found that the cross-correlation between microphones on *different* I2S paths (e.g., Mic 0 on I2S1 vs. Mic 2 on I2S0) is inherently too low and unreliable. This is due to a microsecond-level hardware startup drift between the two I2S controllers. 
-*   **The Solution**: We physically isolate the calculation. I2S0 (elevation pair) and I2S1 (azimuth pair) calculate their time differences (TDOA) strictly within their own perfectly synchronized domains.
-*   **Filtering**: The algorithm maps the two separate time delays to two intersecting cones, yielding multiple spatial solutions. By applying the physical constraints of the mic array's tilt/height, it filters out impossible angles (e.g., underground) to output a single valid `Azimuth` and `Elevation`.
-*   **Tolerance**: This decoupled approach easily absorbs 1~5mm physical assembly errors without significantly degrading the tracking angle.
+| 信号 | ESP32-S3 GPIO | 连接 |
+| --- | --- | --- |
+| BCLK | GPIO4 | 两颗 INMP441 SCK；PCM5102 BCK |
+| WS | GPIO5 | 两颗 INMP441 WS；PCM5102 LRCK |
+| DIN | GPIO7 | Mic0、Mic1 共用 SD |
+| DOUT | GPIO10 | PCM5102 DIN |
+| MCLK | GPIO9 | PCM5102 SCK，256fs = 12.288 MHz |
+| Mic0 L/R | GND | I2S 左时隙，物理左侧 |
+| Mic1 L/R | 3V3 | I2S 右时隙，物理右侧 |
 
-#### 3. Native USB Output
-The ESP32-S3 acts as a USB Composite Device:
-*   **UAC (USB Audio Class)**: Streams 16kHz raw PCM audio to the host.
-*   **CDC (Communications Device Class)**: Outputs the localized coordinates in real-time via serial.
+原 GPIO6 的 Mic2/Mic3 不再采集。麦克风间距请在
+`main/mic_array_config.h` 的 `MIC_ARRAY_SPACING_MM` 中按实际距离修改。
+若左右麦克风物理位置颠倒，方位角正负号也会颠倒。
 
-### Hardware Wiring
+## 串口输出
 
-**I2S0 is configured as the Master (clock generator), and I2S1 is the Slave, sharing the clock.**
-
-| Signal | ESP32-S3 GPIO | INMP441 Pin | Notes |
-| :--- | :--- | :--- | :--- |
-| **BCLK** | `GPIO 4` | SCK | Shared across all 4 mics |
-| **WS (L/R)**| `GPIO 5` | WS / L/R | Shared across all 4 mics |
-| **DIN 1 (I2S1)** | `GPIO 7` | SD (Mic 0 & 1) | **Azimuth pair**. Mic 0 L/R to GND, Mic 1 L/R to 3V3 |
-| **DIN 0 (I2S0)** | `GPIO 6` | SD (Mic 2 & 3) | **Elevation pair**. Mic 2 L/R to GND, Mic 3 L/R to 3V3 |
-
-*Adjust coordinates in `main/mic_array_config.h` to match your physical layout.*
-
-### Serial Output Format
-
-Baud rate: 115200. Example output:
 ```text
-azi:42,ele:18,conf:90,vad:1
+azi:42,ele:0,conf:90,vad:1
 ```
-*   **`vad`**: Voice Activity (0 or 1). Useful for the host PC to determine when the user stops speaking.
-*   **`conf`**: Confidence (0 ~ 100). Recommend filtering out `conf < 50` on the host side.
-*   **`azi`**: Azimuth (-180° ~ +180°). `0°` is front.
-*   **`ele`**: Elevation (-90° ~ +90°). `0°` is horizon.
 
----
+- `azi`：-90°～+90°，左正右负。与原四麦版本的角度正负约定不同。
+- `ele`：有效定位固定为 0，仅保留字段，不代表实际测得仰角。
+- `conf`：互相关峰值换算为 0～100，并非经校准的定位正确概率。
+- `vad`：当前人声检测状态，0 或 1。
+- 无效定位输出 `azi:null,ele:null,conf:0`。
 
-## 🇨🇳 中文版
+语音开始时从最近 6 帧选取能量峰值帧定位；持续语音每 5 帧（约 150 ms）
+更新一次。CDC 仍约每秒上报一次；静音时保留最近方向，`vad` 变为 0。
 
-一种基于 ESP32-S3 的 4 麦克风 3D 声源定位实现方案。
-支持原生 USB 复合设备输出（免驱的 UAC 音频流 + CDC 串口输出声源坐标）。
+CDC 同时支持身份查询 `getname:WHO_ARE_YOU`，响应 `IAM:ESP_MIC`。
 
-### 设计思路与踩坑经验
+## 构建与验证
 
-#### 1. VAD 触发器
-模块没有使用占用大量资源的波束成形常驻计算，也没有使用算力较重的神经网络 VAD（如 ESP-SR 的 VADN），而是使用了极轻量的 **WebRTC VAD**。
-*   **原因**：4 麦克风的 TDOA（到达时间差）空间解算非常消耗 CPU。WebRTC VAD 在这里仅作为一个“扳机”，只有在确实检测到人声时，才启动 TDOA 计算。这为 ESP32-S3 留出了足够的算力去处理屏幕 UI 渲染等其他任务。
+使用已安装并导出环境的 ESP-IDF 5.5.4；现有配置面向 ESP32-S3、16 MB Flash
+和八线 PSRAM。依赖 esp-sr、esp_tinyusb 与 TinyUSB，沿用项目现有组件。
 
-#### 2. 双锥面相交的空间解算
-我们**彻底摒弃了要求 4 个通道绝对时间对齐的传统波束矩阵算法**，改为使用独立的“双锥面相交”几何算法。
-*   **我们踩过的坑**：ESP32-S3 需要同时使用两个 I2S 外设（I2S0 和 I2S1）才能采集 4 路麦克风。在实际工程测试中发现，尽管它们共用时钟管脚，但底层硬件启动时仍存在微秒级的异步漂移。这导致**非同一路（跨 I2S0 和 I2S1）的麦克风之间，相关性极低且不可靠**。如果强行把 4 个麦克风的数据放在同一个矩阵里算延迟，结果往往是失效的。
-*   **破局方案**：我们将水平对（I2S1）和垂直对（I2S0）在算法上完全隔离。让它们各自在自己 100% 同步的硬件域内单独计算 TDOA。
-*   **概率过滤**：水平对和垂直对算出的延迟，在几何上对应两个圆锥面。算法联立这两个锥面方程，会得出几个可能的 3D 坐标解。随后结合麦克风阵列对地面的物理安装倾角，直接舍弃掉指向地板等不合理的解，最终得出一个高置信度的 `Azimuth`（方位角）和 `Elevation`（高度角）。
-*   **容错率**：因为解耦了运算，装配时 1~5mm 的物理误差，最终只会导致 1°~3° 的角度偏差，完全在实际应用的可接受范围内。
-
-#### 3. USB 复合输出
-使用 ESP32-S3 的原生 USB，实现一根 Type-C 线直连电脑：
-*   **🎤 USB 麦克风 (UAC)**：上位机可直接录制 16kHz 原始音频。
-*   **📊 虚拟串口 (CDC)**：实时输出定位坐标。
-
-### 硬件接线
-
-**采用 I2S0 作为 Master 输出时钟，I2S1 作为 Slave 共享时钟的接法。**
-
-| 信号 | ESP32-S3 GPIO | INMP441 引脚 | 备注说明 |
-| :--- | :--- | :--- | :--- |
-| **BCLK** | `GPIO 4` | SCK | 4 颗麦克风共用 |
-| **WS (左右声道)**| `GPIO 5` | WS / L/R | 4 颗麦克风共用 |
-| **DIN 1 (I2S1)** | `GPIO 7` | SD (Mic 0 & 1) | **水平方位对**。Mic 0 的 L/R 接地(左)，Mic 1 的 L/R 接 3V3(右) |
-| **DIN 0 (I2S0)** | `GPIO 6` | SD (Mic 2 & 3) | **高度仰角对**。Mic 2 的 L/R 接地(左)，Mic 3 的 L/R 接 3V3(右) |
-
-*请在 `main/mic_array_config.h` 中根据实际的毫米(mm)距离配置坐标。*
-
-### 上位机通信格式
-
-波特率：115200。数据输出示例：
-```text
-azi:42,ele:18,conf:90,vad:1
+```sh
+idf.py build
 ```
-*   **`vad`**：人声检测 (0 或 1)。上位机可借此判断用户是否说完话，作为大模型语音识别的断句依据。
-*   **`conf`**：置信度 (0 ~ 100)。建议上位机过滤掉 `conf < 50` 的低质量数据（通常是风噪或回音）。
-*   **`azi`**：水平方位角 (-180° ~ +180°)。`0°` 为正前方。
-*   **`ele`**：俯仰高度角 (-90° ~ +90°)。`0°` 为水平面。
 
----
+主机算法测试需要 Python 3 和 PATH 中的主机 GCC：
 
-## 🛠️ 构建要求
+```sh
+python tests/test_azimuth.py
+python tests/test_i2s_playback.py
+```
 
-* `ESP-IDF 5.x` 
-* `esp-sr` component (用于 VAD 依赖)
-
-**`sdkconfig.defaults` 配置须知**：
-* 需开启 **PSRAM** 以提供音频缓冲。
-* 需开启 **TinyUSB** 驱动及 I2S 的 **ISR IRAM-Safe**。
+测试直接提取并编译固件的 C 算法函数，验证合成双通道音频的左右方向、
+前半圆范围、±90° 边界、不合理延迟、静音、缺失通道和 30 ms 帧关系。
+该测试不替代实物录音、接线及角度标定。
 
 ## License
 
