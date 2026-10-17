@@ -15,7 +15,7 @@ void app_main(void)
 
     /*
      * The processor owns the raw audio frame size. I2S outputs interleaved
-     * mic frames; UAC takes one raw mic and TDOA uses all available mics.
+     * mic frames; UAC takes one raw microphone without voice gating.
      */
     ESP_ERROR_CHECK(i2s_mic_driver_init(afe_processor_get_feed_samples_per_channel()));
     esp_err_t ret = i2s_mic_driver_start();

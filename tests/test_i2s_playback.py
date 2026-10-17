@@ -10,7 +10,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from test_azimuth import ROOT, function
+from test_audio_capture import ROOT, function
 
 
 def main():

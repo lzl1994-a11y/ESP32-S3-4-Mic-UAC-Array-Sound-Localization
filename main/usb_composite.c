@@ -175,10 +175,6 @@ static void audio_spk_task(void *arg)
             if (to_read > 0) {
                 uint16_t bytes_read = tud_audio_read(spk_buf, to_read);
                 if (bytes_read > 0) {
-                    static int play_count = 0;
-                    if (++play_count % 500 == 0) {
-                        ESP_LOGI(TAG, "Speaker receiving data from PC... bytes: %d, sample: %d", bytes_read, spk_buf[0]);
-                    }
                     // USB provides 48 kHz, stereo, 16-bit PCM: 4 bytes per frame.
                     esp_err_t ret = i2s_mic_driver_write_tx(spk_buf, bytes_read / 4);
                     if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
@@ -226,19 +222,6 @@ static void cdc_rx_callback(int itf, cdcacm_event_t *event)
     }
 }
 
-static void cdc_line_state_changed_callback(int itf, cdcacm_event_t *event)
-{
-    if (event == NULL || event->type != CDC_EVENT_LINE_STATE_CHANGED) {
-        return;
-    }
-
-    ESP_LOGI(TAG,
-             "CDC line state: itf=%d dtr=%d rts=%d",
-             itf,
-             event->line_state_changed_data.dtr ? 1 : 0,
-             event->line_state_changed_data.rts ? 1 : 0);
-}
-
 esp_err_t usb_composite_init(void)
 {
     if (s_initialized) {
@@ -252,9 +235,8 @@ esp_err_t usb_composite_init(void)
     /*
      * Move TinyUSB task to Core 0 and raise priority to 6.
      * - Core 0 runs i2s_capture (prio 8) — TinyUSB at prio 6 won't starve it.
-     * - Core 1 runs audio_capture (prio 9) — moving TinyUSB off Core 1
-     *   means it no longer competes with the heavy TDOA + UAC write path.
-     * - prio 6 > default 5 gives it an edge over cdc_report (5) and Tmr Svc (1).
+     * - Core 1 runs audio_capture (prio 9), which forwards raw mic PCM to UAC.
+     * - prio 6 > speaker task (5) helps keep USB transfers serviced.
      */
     tusb_cfg.task = TINYUSB_TASK_CUSTOM(4096, 6, 0);
 
@@ -272,7 +254,7 @@ esp_err_t usb_composite_init(void)
         .cdc_port = TINYUSB_CDC_ACM_0,
         .callback_rx = cdc_rx_callback,
         .callback_rx_wanted_char = NULL,
-        .callback_line_state_changed = cdc_line_state_changed_callback,
+        .callback_line_state_changed = NULL,
         .callback_line_coding_changed = NULL,
     };
     ESP_RETURN_ON_ERROR(tinyusb_cdcacm_init(&cdc_cfg), TAG, "init CDC ACM failed");

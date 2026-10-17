@@ -24,7 +24,6 @@
 #define I2S_READ_TIMEOUT_MS 200
 #define I2S_STARTUP_SETTLE_MS 20
 #define I2S_STARTUP_FLUSH_FRAMES 3
-#define I2S_CAPTURE_LOG_FRAMES 4
 #define INMP441_32_TO_16_SHIFT 16
 #define I2S_SPK_GAIN 4             // 4x digital gain for speaker output (PCM5102)
 
@@ -41,7 +40,6 @@ static TaskHandle_t s_capture_task;
 static size_t s_samples_per_channel;
 static size_t s_i2s_read_bytes;
 static size_t s_frame_bytes;
-static uint32_t s_captured_frames;
 static bool s_initialized;
 static volatile bool s_started;
 static volatile bool s_tx_enabled;
@@ -167,12 +165,6 @@ static void i2s_capture_task(void *arg)
             frame[i] = inmp441_32_to_16(s_i2s1_raw[i]);
         }
 
-        if (s_captured_frames < I2S_CAPTURE_LOG_FRAMES) {
-            ESP_LOGI(TAG, "captured frame %u: mic0=%d mic1=%d",
-                     (unsigned)(s_captured_frames + 1), frame[0], frame[1]);
-        }
-        s_captured_frames++;
-
         if (xQueueSend(s_filled_queue, &frame, pdMS_TO_TICKS(10)) != pdTRUE) {
             ESP_LOGW(TAG, "mic frame queue full, dropping one frame");
             recycle_frame(frame);
@@ -271,7 +263,6 @@ esp_err_t i2s_mic_driver_start(void)
         return ret;
     }
 
-    s_captured_frames = 0;
     s_started = true;
     BaseType_t ok = xTaskCreatePinnedToCore(i2s_capture_task,
                                             "i2s_capture",
@@ -363,7 +354,6 @@ esp_err_t i2s_mic_driver_deinit(void)
     s_samples_per_channel = 0;
     s_i2s_read_bytes = 0;
     s_frame_bytes = 0;
-    s_captured_frames = 0;
     s_initialized = false;
     return ESP_OK;
 }
